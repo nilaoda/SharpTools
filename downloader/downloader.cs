@@ -11,51 +11,57 @@ using System.Threading.Tasks;
 
 public class RobustDownloader
 {
-    // === 配置参数 ===
-    private const int MAX_RETRIES = 20;        // 重试次数
-    private const int UI_UPDATE_RATE_MS = 500; // UI刷新频率
-    private const int SPEED_WINDOW_SEC = 3;    // 速度平滑窗口(秒)
-    private const int STALL_TIMEOUT_MINUTES = 3; // 僵死超时时间(分钟)
+    // ==========================================
+    // 配置参数 (Configuration)
+    // ==========================================
+    private const int MAX_RETRIES = 50;             // 大幅增加重试次数，因为现在有了切片模式，重试不再可怕
+    private const int UI_UPDATE_RATE_MS = 500;      // UI 刷新频率 (毫秒)
+    private const int SPEED_WINDOW_SEC = 3;         // 速度计算的滑动窗口 (秒)
+    private const int STALL_TIMEOUT_MINUTES = 1;    // 判定下载僵死的超时时间 (分钟)
+    private const int READ_TIMEOUT_SECONDS = 30;    // 读取流超时时间 (防止僵尸连接)
 
-    // === 运行时参数 ===
-    private static int _maxBufferCount; 
+    // ==========================================
+    // 运行时状态 (Runtime State)
+    // ==========================================
+    private static int _maxBufferCount;
     private static int _blockSizeBytes;
     private static string _savePath = "";
     private static string _downloadingPath = "";
     private static string _configPath = "";
     private static long _totalFileSize = 0;
-    private static string[] _originalArgs; // 保存原始参数用于重启
+    private static string[] _originalArgs;
+    
+    // 用于 UI 显示当前的诊断状态
+    private static string _diagStatus = "Initializing...";
 
-    // === 服务器时间 ===
+    // 服务器元数据
     private static DateTime? _serverLastModifiedUtc = null;
 
-    // === 状态控制 ===
-    private static long _nextWriteOffset = 0; 
+    // 偏移量控制
+    private static long _nextWriteOffset = 0;
     private static readonly ConcurrentDictionary<long, byte[]> _buffer = new ConcurrentDictionary<long, byte[]>();
-    
-    // === 信号量 ===
-    private static SemaphoreSlim _downloadSlots; 
-    private static SemaphoreSlim _bufferSlots;   
+
+    // 并发控制 (信号量)
+    private static SemaphoreSlim _downloadSlots;
+    private static SemaphoreSlim _bufferSlots;
     private static readonly object _configLock = new object();
 
-    // === 统计与速度计算 ===
-    private static long _totalBytesWritten = 0; // 磁盘落盘量
-    private static long _totalNetworkBytes = 0; // 实时网络流量
+    // 统计数据
+    private static long _totalBytesWritten = 0;
+    private static long _totalNetworkBytes = 0;
     private static Stopwatch _globalStopwatch;
-    
-    // 速度计算滑动窗口
     private static readonly Queue<(double Time, long Bytes)> _speedSamples = new Queue<(double, long)>();
 
-    // === 下载管理器 ===
+    // 下载管理器
     private static DownloadManager _downloadManager;
 
     public static async Task Main(string[] args)
     {
-        _originalArgs = args; // 保存参数
+        _originalArgs = args;
 
         if (args.Length < 4)
         {
-            PrintColor("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only]", ConsoleColor.Yellow);
+            LogToConsole("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only]", ConsoleColor.Yellow);
             return;
         }
 
@@ -64,92 +70,87 @@ public class RobustDownloader
         _downloadingPath = _savePath + ".downloading";
         _configPath = _savePath + ".cfg";
         int threadCount = int.Parse(args[2]);
-        int blockSizeMb = int.Parse(args[3]);
+        double blockSizeMb = double.Parse(args[3]);
 
-        // 检查是否只执行 CRC64
         bool crcOnly = args.Any(a => a.Equals("--crc-only", StringComparison.OrdinalIgnoreCase));
 
         if (!crcOnly && File.Exists(_savePath))
         {
-            PrintColor($"⚠️ Target file already exists, skipping download: {_savePath}", ConsoleColor.Yellow);
+            LogToConsole($"Target file already exists, skipping download: {_savePath}", ConsoleColor.Yellow);
             return;
         }
 
-        _blockSizeBytes = blockSizeMb * 1024 * 1024;
+        _blockSizeBytes = (int)(blockSizeMb * 1024 * 1024);
         _maxBufferCount = Math.Max(threadCount * 2, 32);
 
         _downloadSlots = new SemaphoreSlim(threadCount, threadCount);
         _bufferSlots = new SemaphoreSlim(_maxBufferCount, _maxBufferCount);
 
+        // 配置连接池，适当轮换端口
         var socketsHandler = new SocketsHttpHandler
         {
             PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-            MaxConnectionsPerServer = threadCount + 10 // 稍微增加一点冗余连接数，防止重启瞬间耗尽
+            MaxConnectionsPerServer = threadCount + 20
         };
         var httpClient = new HttpClient(socketsHandler) { Timeout = TimeSpan.FromHours(24) };
-        // 设置默认 User-Agent
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36");
 
         try
         {
             Console.Clear();
-            PrintColor("=== Robust Downloader v4.5 (Fixed Logic) ===", ConsoleColor.Cyan);
+            LogToConsole("=== Robust Downloader v4.8 (Surgical Mode) ===", ConsoleColor.Cyan);
             Console.WriteLine($"URL: {url}");
             Console.WriteLine($"Out: {_savePath}\n");
 
-            // 1. 初始化 & 提取 CRC64
+            // 初始化连接并获取元数据
             bool supportsRange = await InitializeDownloadAsync(httpClient, url, crcOnly);
 
-            // 如果只要 CRC64，则直接退出
             if (crcOnly)
             {
-                PrintColor("\n✅ CRC64 extraction completed. Exiting as --crc-only is set.", ConsoleColor.Green);
+                LogToConsole("\nCRC64 extraction completed. Exiting.", ConsoleColor.Green);
                 return;
             }
 
             if (!supportsRange)
             {
-                PrintColor("⚠️  WARNING: Server does not support Range. Switching to single-threaded mode.", ConsoleColor.Red);
-                await SingleThreadDownload(httpClient, url);
+                LogToConsole("WARNING: Server does not support Range. Switching to single-threaded mode.", ConsoleColor.Red);
                 return;
             }
 
             LoadResumeOffset();
             PrepareDiskSpace();
 
-            // 移除这里原来的 GenerateChunks，改为在 Manager 内部动态生成，防止重启时逻辑不一致
+            // 记录本次会话开始时的偏移量，用于准确计算平均速度
+            long sessionStartOffset = _nextWriteOffset;
             long remainingBytes = _totalFileSize - _nextWriteOffset;
-
-            // 初始化网络计数
             _totalNetworkBytes = _nextWriteOffset;
 
             Console.WriteLine($"Total Size:      {FormatSize(_totalFileSize)}");
-            Console.WriteLine($"Resuming From:   {FormatSize(_nextWriteOffset)} ({(_nextWriteOffset/(double)_totalFileSize):P1})");
+            Console.WriteLine($"Resuming From:   {FormatSize(_nextWriteOffset)} ({(_nextWriteOffset / (double)_totalFileSize):P1})");
             Console.WriteLine($"Remaining:       {FormatSize(remainingBytes)}");
             Console.WriteLine($"Threads:         {threadCount}");
+            Console.WriteLine($"Mode:            Adaptive Fragmentation Enabled");
 
-            PrintColor("\n=== Starting Download ===", ConsoleColor.Green);
+            LogToConsole("\n=== Starting Download ===", ConsoleColor.Green);
             _globalStopwatch = Stopwatch.StartNew();
 
-            // 初始化下载管理器
             _downloadManager = new DownloadManager(url, threadCount);
 
+            // 启动后台任务
             var writerTask = Task.Run(WriterLoop);
-
-            // 启动 UI & 看门狗线程
             var uiTask = Task.Run(() => UILoop());
 
-            // 启动下载管道（可软重启）
+            // 启动主下载循环
             await _downloadManager.StartAsync();
 
             await writerTask;
 
-            // 正常结束
+            // 完成处理
             if (_totalBytesWritten == _totalFileSize)
             {
                 if (File.Exists(_configPath)) File.Delete(_configPath);
-
                 if (File.Exists(_savePath)) File.Delete(_savePath);
+                
                 File.Move(_downloadingPath, _savePath);
 
                 if (_serverLastModifiedUtc.HasValue)
@@ -158,25 +159,30 @@ public class RobustDownloader
                     File.SetLastWriteTimeUtc(_savePath, _serverLastModifiedUtc.Value);
                 }
 
+                // 计算平均速度
+                long bytesDownloadedThisSession = _totalBytesWritten - sessionStartOffset;
+                double elapsedSeconds = _globalStopwatch.Elapsed.TotalSeconds;
+                long avgSpeed = elapsedSeconds > 0 ? (long)(bytesDownloadedThisSession / elapsedSeconds) : 0;
+
                 Console.WriteLine();
-                PrintColor($"\n✅ Download Completed Successfully!", ConsoleColor.Green);
-                PrintColor($"Avg Speed: {FormatSize((long)(_totalFileSize / _globalStopwatch.Elapsed.TotalSeconds))}/s", ConsoleColor.Gray);
-                PrintColor($"Total Time: {_globalStopwatch.Elapsed:hh\\:mm\\:ss}", ConsoleColor.Gray);
+                LogToConsole($"\nDownload Completed Successfully!", ConsoleColor.Green);
+                LogToConsole($"Avg Speed: {FormatSize(avgSpeed)}/s", ConsoleColor.Gray);
+                LogToConsole($"Total Time: {_globalStopwatch.Elapsed:hh\\:mm\\:ss}", ConsoleColor.Gray);
             }
             else
             {
-                PrintColor($"\n❌ Error: Size mismatch. Written: {_totalBytesWritten}, Expected: {_totalFileSize}", ConsoleColor.Red);
+                LogToConsole($"\nError: Size mismatch. Written: {_totalBytesWritten}, Expected: {_totalFileSize}", ConsoleColor.Red);
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine();
-            PrintColor($"\n❌ Fatal Error: {ex.Message}", ConsoleColor.Red);
+            LogToConsole($"\nFatal Error: {ex.Message}", ConsoleColor.Red);
         }
     }
 
     // ======================================
-    // ===== 原有方法必须在 DownloadManager 外部 =====
+    // 辅助方法 (Helper Methods)
     // ======================================
 
     private static async Task<bool> InitializeDownloadAsync(HttpClient client, string url, bool crcOnly = false)
@@ -187,18 +193,17 @@ public class RobustDownloader
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
 
-        PrintColor("--- Server Headers ---", ConsoleColor.DarkGray);
+        LogToConsole("--- Server Headers ---", ConsoleColor.DarkGray);
         foreach (var header in response.Headers)
             Console.WriteLine($"{header.Key}: {string.Join(", ", header.Value)}");
         foreach (var header in response.Content.Headers)
             Console.WriteLine($"{header.Key}: {string.Join(", ", header.Value)}");
         Console.WriteLine("----------------------");
 
-        // === 提取 LastModified ===
         if (response.Content.Headers.LastModified.HasValue)
             _serverLastModifiedUtc = response.Content.Headers.LastModified.Value.UtcDateTime;
 
-        // === 提取 CRC64 ===
+        // 尝试提取 CRC64
         if (response.Headers.TryGetValues("x-cos-hash-crc64ecma", out var crcValues))
         {
             string crcValue = crcValues.FirstOrDefault();
@@ -210,7 +215,7 @@ public class RobustDownloader
                 if (!File.Exists(crcFileName) || File.ReadAllText(crcFileName) != content)
                 {
                     await File.WriteAllTextAsync(crcFileName, content);
-                    PrintColor($"[CRC64] Value extracted and saved to: {Path.GetFileName(crcFileName)}", ConsoleColor.Cyan);
+                    LogToConsole($"[CRC64] Saved to: {Path.GetFileName(crcFileName)}", ConsoleColor.Cyan);
                 }
             }
         }
@@ -221,7 +226,7 @@ public class RobustDownloader
 
         if (crcOnly) return false;
 
-        // === 探测是否支持 Range 请求 ===
+        // 检查 Range 支持
         bool supportsRange = false;
         try
         {
@@ -229,7 +234,7 @@ public class RobustDownloader
             rangeRequest.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
             using var rangeResponse = await client.SendAsync(rangeRequest, HttpCompletionOption.ResponseHeadersRead);
 
-            if (rangeResponse.StatusCode == System.Net.HttpStatusCode.PartialContent)
+            if (rangeResponse.StatusCode == HttpStatusCode.PartialContent)
                 supportsRange = true;
         }
         catch { supportsRange = false; }
@@ -237,66 +242,124 @@ public class RobustDownloader
         return supportsRange;
     }
 
-    // 修改：增加了 CancellationToken 参数
+    /// <summary>
+    /// 下载指定分块，包含重试逻辑和连接超时处理
+    /// </summary>
     private static async Task DownloadChunkWithRetry(HttpClient client, string url, Chunk chunk, CancellationToken token)
     {
         int retry = 0;
-        while (retry < MAX_RETRIES)
-        {
-            // 如果已经被取消，直接抛出，不要再尝试重连
-            token.ThrowIfCancellationRequested();
+        
+        // 预分配整个块的内存
+        long totalSize = chunk.End - chunk.Start + 1;
+        byte[] data = new byte[totalSize];
+        int bytesReceivedTotal = 0; // 当前已经下载到 data 里的字节数
 
+        while (retry < MAX_RETRIES && bytesReceivedTotal < totalSize)
+        {
+            token.ThrowIfCancellationRequested();
             try
             {
-                var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(chunk.Start, chunk.End);
+                // 计算本次请求的范围
+                long requestStart = chunk.Start + bytesReceivedTotal;
+                long requestEnd = chunk.End;
+                
+                // 动态切片
+                long remaining = requestEnd - requestStart + 1;
+                long currentRequestLimit = remaining;
 
-                // 重点：将 Token 传递给 SendAsync，这样软重启时能立即断开连接
-                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
-                if (response.StatusCode != HttpStatusCode.PartialContent) 
-                    throw new Exception($"Invalid Status Code: {response.StatusCode}");
+                if (retry > 2) currentRequestLimit = 1 * 1024 * 1024; // >2次重试：每次只下 1MB
+                if (retry > 5) currentRequestLimit = 64 * 1024;  // >5次重试：每次只下 64KB
+                if (retry > 8) currentRequestLimit = 32 * 1024;       // >8次重试：每次只下 32KB
+
+                if (currentRequestLimit < remaining)
+                {
+                    requestEnd = requestStart + currentRequestLimit - 1;
+                    // LogToConsole 可能会刷屏，这里不打印，但逻辑是在悄悄执行“手术”
+                }
+                // ===========================================
+
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(requestStart, requestEnd);
+
+                // 连接建立超时设置
+                using var ctsSend = CancellationTokenSource.CreateLinkedTokenSource(token);
+                ctsSend.CancelAfter(TimeSpan.FromSeconds(20));
+
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ctsSend.Token);
+                
+                if (!response.IsSuccessStatusCode)
+                {
+                    if ((int)response.StatusCode == 429 || (int)response.StatusCode == 503)
+                    {
+                        retry++;
+                        await Task.Delay(2000 * retry, token); // 指数退避
+                        continue;
+                    }
+                    response.EnsureSuccessStatusCode();
+                }
 
                 using var stream = await response.Content.ReadAsStreamAsync(token);
                 
-                long expectedSize = chunk.End - chunk.Start + 1;
-                byte[] data = new byte[expectedSize];
-                
-                int totalRead = 0;
-                while (totalRead < expectedSize)
+                long expectedForThisRequest = requestEnd - requestStart + 1;
+                int bytesReadForThisRequest = 0;
+
+                while (bytesReadForThisRequest < expectedForThisRequest)
                 {
-                    // 重点：将 Token 传递给 ReadAsync
-                    int read = await stream.ReadAsync(data, totalRead, (int)(expectedSize - totalRead), token);
-                    if (read == 0) break;
-                    totalRead += read;
-                    Interlocked.Add(ref _totalNetworkBytes, read);
+                    // 为每次 ReadAsync 设置独立的超时监控，防止僵尸连接
+                    using var ctsRead = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    ctsRead.CancelAfter(TimeSpan.FromSeconds(READ_TIMEOUT_SECONDS));
+
+                    try 
+                    {
+                        // 直接写入 data 数组的正确偏移位置
+                        int read = await stream.ReadAsync(data, bytesReceivedTotal, (int)(expectedForThisRequest - bytesReadForThisRequest), ctsRead.Token);
+                        
+                        if (read == 0) break; // 连接意外断开
+
+                        bytesReceivedTotal += read;     // 总进度推进
+                        bytesReadForThisRequest += read; // 本次请求进度推进
+                        Interlocked.Add(ref _totalNetworkBytes, read);
+                        
+                        // if (retry > 0) retry = Math.Max(1, retry - 1); 
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        if (token.IsCancellationRequested) throw;
+                        throw new IOException($"Read timeout after {READ_TIMEOUT_SECONDS}s");
+                    }
                 }
-
-                if (totalRead != expectedSize) throw new IOException("Stream ended early");
-
-                if (!_buffer.TryAdd(chunk.Start, data)) { }
-                return; // 成功下载并加入 Buffer
-            }
-            catch (OperationCanceledException)
-            {
-                throw; // 向上抛出取消异常
+                
+                // 如果本次请求完美结束，循环会继续，处理剩下的部分（如果有）
+                // 此时 bytesReceivedTotal 增加了，下一次循环的 requestStart 会自动后移
             }
             catch (Exception)
             {
                 retry++;
-                if (retry >= MAX_RETRIES) throw; 
-                try { await Task.Delay(Math.Min(5000, 1000 * retry), token); } catch { }
+                if (retry >= MAX_RETRIES) throw; // 真的没救了
+                
+                // 简单的退避等待
+                try { await Task.Delay(500 + (retry * 200), token); } catch { }
             }
         }
+
+        // 最终检查：是否填满了整个块
+        if (bytesReceivedTotal != totalSize) 
+            throw new IOException($"Chunk failed after {MAX_RETRIES} retries. Got {bytesReceivedTotal}/{totalSize}");
+
+        // 成功！加入缓冲区
+        if (!_buffer.TryAdd(chunk.Start, data)) { }
     }
 
+    /// <summary>
+    /// 顺序写入循环（针对机械硬盘优化）
+    /// </summary>
     private static void WriterLoop()
     {
-        // 保持原来的逻辑：顺序写入，这对机械硬盘至关重要
         using var fs = new FileStream(_downloadingPath, FileMode.Open, FileAccess.Write, FileShare.Read);
         fs.Seek(_nextWriteOffset, SeekOrigin.Begin);
 
         long unflushedBytes = 0; 
-        const long FLUSH_THRESHOLD = 32 * 1024 * 1024; 
+        const long FLUSH_THRESHOLD = 32 * 1024 * 1024; // 32MB 缓冲
 
         while (_totalBytesWritten < _totalFileSize)
         {
@@ -307,10 +370,7 @@ public class RobustDownloader
                 _totalBytesWritten += data.Length;
                 unflushedBytes += data.Length;
 
-                // 移除已写入的块
                 _buffer.TryRemove(_nextWriteOffset - data.Length, out _);
-                
-                // 重点：Writer 负责释放“成功消费”的 Buffer 配额
                 _bufferSlots.Release();
 
                 if (unflushedBytes >= FLUSH_THRESHOLD || _totalBytesWritten == _totalFileSize)
@@ -322,13 +382,17 @@ public class RobustDownloader
             }
             else
             {
-                Thread.Sleep(20); // 机械硬盘不建议轮询太快
+                // 等待数据到达
+                Thread.Sleep(20);
             }
         }
         fs.Flush(true);
         UpdateConfigFile(_totalFileSize);
     }
 
+    /// <summary>
+    /// UI 刷新与卡顿检测线程
+    /// </summary>
     private static async Task UILoop()
     {
         long lastNetworkBytes = 0;
@@ -338,6 +402,39 @@ public class RobustDownloader
         {
             long currentBytes = Interlocked.Read(ref _totalNetworkBytes);
             
+            // --- 实时诊断逻辑 ---
+            
+            bool isBufferFull = _bufferSlots.CurrentCount == 0;
+            bool areThreadsBusy = _downloadSlots.CurrentCount == 0;
+            bool hasWriterBlock = _buffer.ContainsKey(_nextWriteOffset);
+            
+            if (currentBytes > lastNetworkBytes)
+            {
+                _diagStatus = "Running";
+            }
+            else
+            {
+                // 判定卡顿原因
+                if (hasWriterBlock)
+                {
+                    _diagStatus = "Disk I/O Bottleneck";
+                }
+                else if (isBufferFull)
+                {
+                    _diagStatus = "DEADLOCK: Buffer Full & Missing Next Block";
+                }
+                else if (areThreadsBusy)
+                {
+                    _diagStatus = "Network Hang / Fragmenting";
+                }
+                else
+                {
+                    _diagStatus = "Idle / Queue Empty";
+                }
+            }
+
+            // --- 卡顿处理 ---
+
             if (currentBytes > lastNetworkBytes)
             {
                 lastNetworkBytes = currentBytes;
@@ -346,17 +443,27 @@ public class RobustDownloader
             else
             {
                 var stalledDuration = DateTime.Now - lastActivityTime;
-                if (stalledDuration.TotalMinutes >= STALL_TIMEOUT_MINUTES)
+                
+                // 如果卡顿超过阈值（15秒检查一次）
+                if (stalledDuration.TotalSeconds > 15)
                 {
-                    Console.WriteLine();
-                    PrintColor($"\n⚠️  STALL DETECTED! Download speed has been 0 for {STALL_TIMEOUT_MINUTES} minutes.", ConsoleColor.Red);
-                    PrintColor("🔄 Restarting downloader automatically...", ConsoleColor.Yellow);
-                    
-                    // 触发软重启
-                    _downloadManager.SoftRestart();
-                    
-                    // 稍微重置一下时间，避免连续触发
-                    lastActivityTime = DateTime.Now; 
+                    // 死锁解决：外科手术式移除
+                    if (_diagStatus.Contains("DEADLOCK"))
+                    {
+                        ResolveDeadlock();
+                        lastActivityTime = DateTime.Now; 
+                    }
+                    // 普通卡顿：软重启
+    /// 通过移除内存中此时不需要的最远块来解除死锁
+    /// 生成下载队列，严格限制窗口大小在 Buffer 容量内，防止填充无用的远端块
+                    else if (stalledDuration.TotalMinutes >= STALL_TIMEOUT_MINUTES)
+                    {
+                        LogToConsole($"STALL DETECTED! Duration: {stalledDuration.TotalMinutes:F1} min. Reason: {_diagStatus}", ConsoleColor.Red);
+                        LogToConsole("Initiating soft restart...", ConsoleColor.Yellow);
+                        
+                        _downloadManager.SoftRestart();
+                        lastActivityTime = DateTime.Now; 
+                    }
                 }
             }
 
@@ -364,36 +471,6 @@ public class RobustDownloader
             await Task.Delay(UI_UPDATE_RATE_MS);
         }
         UpdateUI(Interlocked.Read(ref _totalNetworkBytes), DateTime.Now); 
-    }
-
-    private static async Task SingleThreadDownload(HttpClient client, string url)
-    {
-        // 单线程模式逻辑保持不变
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-        using var stream = await response.Content.ReadAsStreamAsync();
-        using var fs = new FileStream(_downloadingPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-        
-        var buffer = new byte[81920];
-        int read;
-        long total = 0;
-        var sw = Stopwatch.StartNew();
-        long lastTime = 0;
-        long lastBytes = 0;
-        _totalFileSize = response.Content.Headers.ContentLength ?? 0;
-
-        while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-        {
-            await fs.WriteAsync(buffer, 0, read);
-            total += read;
-            if (sw.ElapsedMilliseconds - lastTime > 1000)
-            {
-                double speed = (total - lastBytes) / ((sw.ElapsedMilliseconds - lastTime) / 1000.0);
-                Console.Write($"\rDownloading: {FormatSize(total)} / {FormatSize(_totalFileSize)} | Speed: {FormatSize((long)speed)}/s   ");
-                lastTime = sw.ElapsedMilliseconds;
-                lastBytes = total;
-            }
-        }
-        Console.WriteLine("\nDone.");
     }
 
     private static void LoadResumeOffset()
@@ -432,17 +509,39 @@ public class RobustDownloader
         lock (_configLock) File.WriteAllText(_configPath, offset.ToString());
     }
 
-    // 辅助方法：生成需要下载的块（在 Manager 内部调用）
+    /// <summary>
+    /// 通过移除内存中此时不需要的最远块来解除死锁
+    /// 生成下载队列，严格限制窗口大小在 Buffer 容量内，防止填充无用的远端块
+    /// </summary>
+    private static void ResolveDeadlock()
+    {
+        if (_buffer.IsEmpty) return;
+
+        long furthestOffset = _buffer.Keys.Max();
+
+        if (furthestOffset == _nextWriteOffset) return;
+
+        if (_buffer.TryRemove(furthestOffset, out _))
+        {
+            _bufferSlots.Release();
+            LogToConsole($"[Deadlock Breaker] Evicted block {furthestOffset} to free buffer slot.", ConsoleColor.Magenta);
+        }
+    }
+
+    /// <summary>
+    /// 生成下载队列，严格限制窗口大小在 Buffer 容量内，防止填充无用的远端块
+    /// </summary>
     private static ConcurrentQueue<Chunk> GenerateChunksQueue(long startOffset)
     {
         var queue = new ConcurrentQueue<Chunk>();
         long current = startOffset;
         
-        // 我们需要跳过已经在内存 Buffer 中但还没写入磁盘的块
-        // 防止重复下载导致浪费带宽
+        int windowSize = _maxBufferCount; 
+        int count = 0;
+
         var existingKeys = new HashSet<long>(_buffer.Keys);
 
-        while (current < _totalFileSize)
+        while (current < _totalFileSize && count < windowSize)
         {
             if (!existingKeys.Contains(current))
             {
@@ -450,6 +549,7 @@ public class RobustDownloader
                 queue.Enqueue(new Chunk { Start = current, End = end });
             }
             current += _blockSizeBytes;
+            count++;
         }
         return queue;
     }
@@ -480,20 +580,53 @@ public class RobustDownloader
         long remainingBytes = _totalFileSize - _totalBytesWritten; 
         double progressPct = (double)_totalBytesWritten / _totalFileSize;
 
-        TimeSpan eta = TimeSpan.Zero;
-        if (speed > 0) try { eta = TimeSpan.FromSeconds(remainingBytes / speed); } catch { }
+        string etaStr = "--:--:--";
+        if (speed > 0) 
+        {
+            try 
+            { 
+                TimeSpan eta = TimeSpan.FromSeconds(remainingBytes / speed);
+                etaStr = eta.TotalDays >= 1 
+                    ? $"{eta.Days}d {eta.Hours:D2}:{eta.Minutes:D2}:{eta.Seconds:D2}" 
+                    : $"{eta:hh\\:mm\\:ss}";
+            } 
+            catch { }
+        }
 
-        int barWidth = 25;
+        int barWidth = 20;
         int filled = (int)(progressPct * barWidth);
         string bar = "[" + new string('=', filled) + ">" + new string(' ', Math.Max(0, barWidth - filled - 1)) + "]";
         if (filled >= barWidth) bar = "[" + new string('=', barWidth) + "]";
 
         string speedStr = $"{FormatSize((long)speed)}/s".PadRight(10);
         
-        if ((DateTime.Now - lastActivityTime).TotalSeconds > 10)
+        string extraInfo = "";
+        // 如果卡顿则显示诊断信息
+        if ((DateTime.Now - lastActivityTime).TotalSeconds > 5)
+        {
             speedStr = "STALLED!".PadRight(10);
+            extraInfo = $" | [{_diagStatus}]";
+        }
 
-        Console.Write($"\r{bar} {progressPct:P1} | {FormatSize(_totalBytesWritten)}/{FormatSize(_totalFileSize)} | {speedStr} | ETA: {eta:hh\\:mm\\:ss}   ");
+        // 使用 padding 覆盖可能残留的旧字符
+        string output = $"\r{bar} {progressPct:P1} | {FormatSize(_totalBytesWritten)} | {speedStr} | ETA: {etaStr}{extraInfo}";
+        int padding = Console.WindowWidth - output.Length - 1;
+        if (padding > 0) output += new string(' ', padding);
+        
+        Console.Write(output);
+    }
+
+    /// <summary>
+    /// 辅助方法：打印日志前先清除当前行，防止破坏进度条显示
+    /// </summary>
+    private static void LogToConsole(string msg, ConsoleColor color)
+    {
+        // 先清除当前行
+        Console.Write("\r" + new string(' ', Console.WindowWidth - 1) + "\r");
+        var prev = Console.ForegroundColor;
+        Console.ForegroundColor = color;
+        Console.WriteLine(msg);
+        Console.ForegroundColor = prev;
     }
 
     private static string FormatSize(long bytes)
@@ -505,24 +638,18 @@ public class RobustDownloader
         return $"{len:0.00} {sizes[order]}";
     }
 
-    private static void PrintColor(string msg, ConsoleColor color)
-    {
-        var prev = Console.ForegroundColor;
-        Console.ForegroundColor = color;
-        Console.WriteLine(msg);
-        Console.ForegroundColor = prev;
-    }
-
     private struct Chunk { public long Start; public long End; }
 
-    // ===== DownloadManager 负责软重启 =====
+    // ======================================
+    // 下载管理器
+    // ======================================
     private class DownloadManager
     {
         private string _url;
         private int _threadCount;
         private CancellationTokenSource _cts;
         private HttpClient _client;
-        private volatile bool _isRestarting = false; // 标记是否正在重启中
+        private volatile bool _isRestarting = false;
 
         public DownloadManager(string url, int threadCount)
         {
@@ -536,39 +663,36 @@ public class RobustDownloader
         {
             var handler = new SocketsHttpHandler
             {
+                // 适度的连接寿命，平衡复用与端口轮换
                 PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-                MaxConnectionsPerServer = _threadCount + 10 // 稍微给多一点，防止重启时连接池溢出
+                MaxConnectionsPerServer = _threadCount + 20,
+                ConnectTimeout = TimeSpan.FromSeconds(10)
             };
             return new HttpClient(handler) { Timeout = TimeSpan.FromHours(24) };
         }
 
         public async Task StartAsync()
         {
-            // 只要磁盘没写完，就一直循环（大循环负责处理重启）
             while (_totalBytesWritten < _totalFileSize)
             {
                 _isRestarting = false;
                 
-                // 1. 根据当前的写入进度重新生成队列
                 var chunksQueue = GenerateChunksQueue(_nextWriteOffset);
 
-                // 如果队列为空，说明剩余的块都已经下载在 buffer 里了，只是还没写入硬盘。
-                // 此时不需要启动下载任务，只需要等待 WriterLoop 工作。
                 if (chunksQueue.IsEmpty)
                 {
-                    await Task.Delay(500); // 挂起 500ms，把 CPU 让给 WriterLoop
-                    continue; // 跳过本次循环，重新检查 _totalBytesWritten
+                    await Task.Delay(500);
+                    continue;
                 }
 
                 var activeTasks = new List<Task>();
 
-                PrintColor($"\n[DownloadManager] Starting loop. Chunks remaining: {chunksQueue.Count}", ConsoleColor.DarkGray);
+                LogToConsole($"[DownloadManager] Starting loop. Pending Chunks: {chunksQueue.Count}", ConsoleColor.DarkGray);
 
                 try
                 {
                     while (!chunksQueue.IsEmpty && !_isRestarting)
                     {
-                        // 2. 严格的信号量管理逻辑，防止死锁
                         bool acquiredBuffer = false;
                         bool acquiredThread = false;
 
@@ -595,7 +719,6 @@ public class RobustDownloader
                                     finally
                                     {
                                         _downloadSlots.Release();
-                                        // 如果下载失败/取消，数据没进 buffer，必须在此释放 buffer 配额
                                         if (!success) _bufferSlots.Release();
                                     }
                                 }, _cts.Token));
@@ -620,13 +743,13 @@ public class RobustDownloader
                 }
                 catch (OperationCanceledException)
                 {
-                    PrintColor("\n🔄 DownloadManager is resetting connection pool...", ConsoleColor.Yellow);
+                    LogToConsole("DownloadManager is resetting connection pool...", ConsoleColor.Yellow);
                     try { await Task.WhenAll(activeTasks); } catch { }
                     _cts.Dispose();
                     _cts = new CancellationTokenSource();
                     _client.Dispose();
                     _client = CreateHttpClient();
-                    PrintColor("✅ Reset complete. Resuming download...", ConsoleColor.Yellow);
+                    LogToConsole("Reset complete. Resuming download.", ConsoleColor.Yellow);
                 }
             }
         }
@@ -636,7 +759,7 @@ public class RobustDownloader
             if (!_isRestarting)
             {
                 _isRestarting = true;
-                _cts.Cancel(); // 这会触发 StartAsync 内部的 catch (OperationCanceledException)
+                _cts.Cancel();
             }
         }
     }
