@@ -26,8 +26,9 @@
 
 ### 使用方法
 ```bat
-downloader "url" "save_path" thread_count block_mb [--crc-only]
+downloader "url" "save_path" [thread_count] [block_mb] [--crc-only] [--skip-crc] [--header "k:v"]...
 ```
+默认 thread_count=8，block_mb=16。
 
 #### 使用16线程下载，每个线程负责4MB数据
 ```bat
@@ -37,6 +38,19 @@ downloader "https://sns-video-bd.xhscdn.com/spectrum/1040g2f031qq77ukjmu005n33i6
 #### 仅生成CRC校验文件
 ```bat
 downloader "https://sns-video-bd.xhscdn.com/spectrum/1040g2f031qq77ukjmu005n33i644h64juknajf8" "影视飓风2025相机颁奖！.mp4" 16 4 --crc-only
+```
+
+#### 跳过CRC文件生成
+```bat
+downloader "https://sns-video-bd.xhscdn.com/spectrum/1040g2f031qq77ukjmu005n33i644h64juknajf8" "影视飓风2025相机颁奖！.mp4" --skip-crc
+```
+
+#### 自定义请求头
+```bat
+downloader "https://example.com/video.mp4?token=abc" "video.mp4" \
+  --header "Token:12345678" \
+  --header "Referer:api.example.com" \
+  --header "User-Agent:example_app"
 ```
 
 #### 检验CRC64
