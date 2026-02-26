@@ -128,13 +128,7 @@ public class RobustDownloader
 
         try
         {
-            // 只有在未重定向输出(有真实控制台窗口)时才清屏
-            if (!Console.IsOutputRedirected)
-            {
-                try { Console.Clear(); } catch { }
-            }
-            
-            LogToConsole("=== Robust Downloader v4.8 (Surgical Mode) ===", ConsoleColor.Cyan);
+            LogToConsole("=== Robust Downloader v4.9 ===", ConsoleColor.Cyan);
             Console.WriteLine($"URL: {url}");
             Console.WriteLine($"Out: {_savePath}\n");
 
