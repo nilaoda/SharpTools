@@ -240,7 +240,7 @@ public class RobustDownloader
             _serverLastModifiedUtc = response.Content.Headers.LastModified.Value.UtcDateTime;
 
         // 尝试提取 CRC64
-        if (!skipCrc && response.Headers.TryGetValues("x-cos-hash-crc64ecma", out var crcValues))
+        if (!skipCrc && TryGetCrcHeader(response, out var crcValues))
         {
             string crcValue = crcValues.FirstOrDefault();
             if (!string.IsNullOrEmpty(crcValue))
@@ -687,6 +687,15 @@ public class RobustDownloader
         int order = 0;
         while (len >= 1024 && order < sizes.Length - 1) { order++; len /= 1024; }
         return $"{len:0.00} {sizes[order]}";
+    }
+
+    private static bool TryGetCrcHeader(HttpResponseMessage response, out IEnumerable<string> crcValues)
+    {
+        if (response.Headers.TryGetValues("x-cos-hash-crc64ecma", out crcValues))
+        {
+            return true;
+        }
+        return response.Headers.TryGetValues("x-oss-hash-crc64ecma", out crcValues);
     }
 
     private static List<KeyValuePair<string, string>> ParseCustomHeaders(string[] args)
