@@ -63,9 +63,9 @@ public class RobustDownloader
     {
         _originalArgs = args;
 
-        if (args.Length < 4)
+        if (args.Length < 2)
         {
-            LogToConsole("Usage: downloader \"url\" \"save_path\" thread_count block_mb [--crc-only] [--skip-crc] [--header \"k:v\"]...", ConsoleColor.Yellow);
+            LogToConsole("Usage: downloader \"url\" \"save_path\" [thread_count] [block_mb] [--crc-only] [--skip-crc] [--header \"k:v\"]...", ConsoleColor.Yellow);
             return;
         }
 
@@ -83,8 +83,8 @@ public class RobustDownloader
         _savePath = args[1];
         _downloadingPath = _savePath + ".downloading";
         _configPath = _savePath + ".cfg";
-        int threadCount = int.Parse(args[2]);
-        double blockSizeMb = double.Parse(args[3]);
+        int threadCount = args.Length >= 3 ? int.Parse(args[2]) : 8;
+        double blockSizeMb = args.Length >= 4 ? double.Parse(args[3]) : 16;
 
         bool crcOnly = args.Any(a => a.Equals("--crc-only", StringComparison.OrdinalIgnoreCase));
         bool skipCrc = args.Any(a => a.Equals("--skip-crc", StringComparison.OrdinalIgnoreCase));
