@@ -72,7 +72,7 @@ public class RobustDownloader
         string rawUrl = args[0];
         var uri = new Uri(rawUrl);
 
-        string url = uri.GetLeftPart(UriPartial.Path);
+        string url = uri.GetLeftPart(UriPartial.Authority) + uri.AbsolutePath + uri.Query;
 
         if (!string.IsNullOrEmpty(uri.UserInfo))
         {
