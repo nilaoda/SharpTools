@@ -19,7 +19,6 @@ class Program
     private const int AVERROR_EAGAIN = -11;
     private const int AV_LOG_WARNING = 24;
     private const int AV_LOG_QUIET = -8;
-    private const uint DUPLICATE_SAME_ACCESS = 0x00000002;
     private const int AVCOL_TRC_RESERVED0 = 0;
     private const int AVCOL_TRC_BT709 = 1;
     private const int AVCOL_TRC_UNSPECIFIED = 2;
@@ -79,7 +78,7 @@ class Program
         IntPtr dstBuffer = IntPtr.Zero;
 
         int exitCode = 0;
-        CaptureContext capture = default;
+        CaptureContext? capture = null;
         bool captureStarted = false;
         try
         {
@@ -123,7 +122,7 @@ class Program
             if (!cli.DebugOutput)
             {
                 capture = StartNativeCapture();
-                captureStarted = true;
+                captureStarted = capture != null;
             }
 
             DebugLog(info, "🔍 打开媒体输入");
@@ -233,7 +232,9 @@ class Program
             if (sws != IntPtr.Zero) sws_freeContext(sws);
             if (dstBuffer != IntPtr.Zero) av_freep(ref dstBuffer);
             if (options != IntPtr.Zero) av_dict_free(ref options);
-            if (captureStarted) info.NativeLog = StopNativeCapture(capture);
+            if (captureStarted && capture != null) info.NativeLog = StopNativeCapture(capture);
+            if (string.IsNullOrWhiteSpace(info.NativeLog) && FfmpegLogs.Count > 0)
+                info.NativeLog = string.Join(Environment.NewLine, FfmpegLogs);
         }
         return PrintMediaInfoAndReturn(info, exitCode);
     }
@@ -1608,96 +1609,70 @@ class Program
         if (line.Length > 0) FfmpegLogs.Add(line);
     }
 
-    private struct CaptureContext
+    private class CaptureContext
     {
-        public IntPtr OriginalOut;
-        public IntPtr OriginalErr;
-        public IntPtr FileHandle;
-        public int SavedStdOutFd;
-        public int SavedStdErrFd;
-        public int TempFd;
-        public string TempPath;
+        public string TempPath { get; set; } = "";
+        public int SavedStdOutFd { get; set; } = -1;
+        public int SavedStdErrFd { get; set; } = -1;
+        public int CaptureFd { get; set; } = -1;
     }
 
-    private static CaptureContext StartNativeCapture()
+    private static CaptureContext? StartNativeCapture()
     {
         string tempPath = Path.GetTempFileName();
-        IntPtr hFile = CreateFileW(tempPath, 0x40000000, 0x00000003, IntPtr.Zero, 2, 0x00000080, IntPtr.Zero);
-        if (hFile == new IntPtr(-1))
-        {
-            return default;
-        }
-        IntPtr outHandle = GetStdHandle(-11);
-        IntPtr errHandle = GetStdHandle(-12);
-        SetStdHandle(-11, hFile);
-        SetStdHandle(-12, hFile);
+        int captureFd = OpenCaptureFile(tempPath);
+        if (captureFd < 0) return null;
+
         int savedOutFd = -1;
         int savedErrFd = -1;
-        int tempFd = -1;
         try
         {
-            fflush(IntPtr.Zero);
-            savedOutFd = _dup(1);
-            savedErrFd = _dup(2);
-            if (savedOutFd >= 0 && savedErrFd >= 0)
+            FlushNative();
+            savedOutFd = DupFd(1);
+            savedErrFd = DupFd(2);
+            if (savedOutFd < 0 || savedErrFd < 0) throw new InvalidOperationException("dup failed");
+            if (Dup2Fd(captureFd, 1) < 0) throw new InvalidOperationException("dup2(stdout) failed");
+            if (Dup2Fd(captureFd, 2) < 0) throw new InvalidOperationException("dup2(stderr) failed");
+            return new CaptureContext
             {
-                IntPtr dupHandle;
-                if (DuplicateHandle(GetCurrentProcess(), hFile, GetCurrentProcess(), out dupHandle, 0, false, DUPLICATE_SAME_ACCESS))
-                {
-                    tempFd = _open_osfhandle(dupHandle, 0);
-                    if (tempFd >= 0)
-                    {
-                        _dup2(tempFd, 1);
-                        _dup2(tempFd, 2);
-                    }
-                    else
-                    {
-                        CloseHandle(dupHandle);
-                    }
-                }
-            }
+                TempPath = tempPath,
+                SavedStdOutFd = savedOutFd,
+                SavedStdErrFd = savedErrFd,
+                CaptureFd = captureFd
+            };
         }
-        catch { }
-
-        return new CaptureContext
+        catch
         {
-            OriginalOut = outHandle,
-            OriginalErr = errHandle,
-            FileHandle = hFile,
-            SavedStdOutFd = savedOutFd,
-            SavedStdErrFd = savedErrFd,
-            TempFd = tempFd,
-            TempPath = tempPath
-        };
+            if (savedOutFd >= 0) CloseFd(savedOutFd);
+            if (savedErrFd >= 0) CloseFd(savedErrFd);
+            if (captureFd >= 0) CloseFd(captureFd);
+            try { File.Delete(tempPath); } catch { }
+            return null;
+        }
     }
 
     private static string StopNativeCapture(CaptureContext ctx)
     {
-        if (ctx.FileHandle == IntPtr.Zero) return "";
         try
         {
-            fflush(IntPtr.Zero);
+            FlushNative();
             if (ctx.SavedStdOutFd >= 0)
             {
-                _dup2(ctx.SavedStdOutFd, 1);
-                _close(ctx.SavedStdOutFd);
+                Dup2Fd(ctx.SavedStdOutFd, 1);
+                CloseFd(ctx.SavedStdOutFd);
             }
             if (ctx.SavedStdErrFd >= 0)
             {
-                _dup2(ctx.SavedStdErrFd, 2);
-                _close(ctx.SavedStdErrFd);
+                Dup2Fd(ctx.SavedStdErrFd, 2);
+                CloseFd(ctx.SavedStdErrFd);
             }
-            if (ctx.TempFd >= 0)
+            if (ctx.CaptureFd >= 0)
             {
-                _close(ctx.TempFd);
+                CloseFd(ctx.CaptureFd);
             }
         }
         catch { }
 
-        SetStdHandle(-11, ctx.OriginalOut);
-        SetStdHandle(-12, ctx.OriginalErr);
-        CloseHandle(ctx.FileHandle);
-        ctx.FileHandle = IntPtr.Zero;
         string content = "";
         try
         {
@@ -1713,38 +1688,73 @@ class Program
         return content;
     }
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+    private static int OpenCaptureFile(string path)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            const int O_WRONLY = 0x0001;
+            const int O_BINARY = 0x8000;
+            int fd = win_wopen(path, O_WRONLY | O_BINARY, 0);
+            return fd;
+        }
+        return unix_open(path, 1, 0); // O_WRONLY
+    }
 
-    [DllImport("kernel32.dll")]
-    private static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
+    private static int DupFd(int fd)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return win_dup(fd);
+        return unix_dup(fd);
+    }
 
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetStdHandle(int nStdHandle);
+    private static int Dup2Fd(int source, int target)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return win_dup2(source, target);
+        return unix_dup2(source, target);
+    }
 
-    [DllImport("kernel32.dll")]
-    private static extern bool CloseHandle(IntPtr hObject);
+    private static int CloseFd(int fd)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return win_close(fd);
+        return unix_close(fd);
+    }
 
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetCurrentProcess();
+    private static void FlushNative()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            win_fflush(IntPtr.Zero);
+        else
+            unix_fflush(IntPtr.Zero);
+    }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool DuplicateHandle(IntPtr hSourceProcessHandle, IntPtr hSourceHandle, IntPtr hTargetProcessHandle, out IntPtr lpTargetHandle, uint dwDesiredAccess, bool bInheritHandle, uint dwOptions);
+    [DllImport("msvcrt.dll", CharSet = CharSet.Unicode, EntryPoint = "_wopen", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int win_wopen(string filename, int flags, int mode);
 
-    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int _dup(int fd);
+    [DllImport("msvcrt.dll", EntryPoint = "_dup", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int win_dup(int fd);
 
-    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int _dup2(int fd1, int fd2);
+    [DllImport("msvcrt.dll", EntryPoint = "_dup2", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int win_dup2(int fd1, int fd2);
 
-    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int _close(int fd);
+    [DllImport("msvcrt.dll", EntryPoint = "_close", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int win_close(int fd);
 
-    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int _open_osfhandle(IntPtr osfhandle, int flags);
+    [DllImport("msvcrt.dll", EntryPoint = "fflush", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int win_fflush(IntPtr stream);
 
-    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int fflush(IntPtr stream);
+    [DllImport("libc", EntryPoint = "open", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int unix_open([MarshalAs(UnmanagedType.LPUTF8Str)] string pathname, int flags, int mode);
+
+    [DllImport("libc", EntryPoint = "dup", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int unix_dup(int fd);
+
+    [DllImport("libc", EntryPoint = "dup2", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int unix_dup2(int fd1, int fd2);
+
+    [DllImport("libc", EntryPoint = "close", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int unix_close(int fd);
+
+    [DllImport("libc", EntryPoint = "fflush", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int unix_fflush(IntPtr stream);
 
     private class MediaInfo
     {
