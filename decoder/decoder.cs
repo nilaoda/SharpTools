@@ -558,6 +558,7 @@ class Program
     {
         if (colorTrc == AVCOL_TRC_SMPTE2084) return new HdrDecision(HdrStatus.Yes, "PQ", source + ": trc=SMPTE2084(PQ) => HDR=是");
         if (colorTrc == AVCOL_TRC_ARIB_STD_B67) return new HdrDecision(HdrStatus.Yes, "HLG", source + ": trc=ARIB_STD_B67(HLG) => HDR=是");
+        if (colorPrimaries == AVCOL_PRI_BT2020) return new HdrDecision(HdrStatus.Yes, "", source + ": primaries=BT.2020 => HDR=是");
 
         bool hasBt2020Primaries = colorPrimaries == AVCOL_PRI_BT2020;
         bool hasHdrMatrix = colorSpace == AVCOL_SPC_BT2020_NCL || colorSpace == AVCOL_SPC_BT2020_CL || colorSpace == AVCOL_SPC_ICTCP;
