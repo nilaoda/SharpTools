@@ -4,6 +4,8 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Globalization;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -17,6 +19,7 @@ class Program
 
     private const int AVERROR_EOF = -541478725;
     private const int AVERROR_EAGAIN = -11;
+    private const long AV_NOPTS_VALUE = long.MinValue;
     private const int AV_LOG_WARNING = 24;
     private const int AV_LOG_QUIET = -8;
     private const int AVCOL_TRC_RESERVED0 = 0;
@@ -60,10 +63,12 @@ class Program
         CliOptions cli = ParseArgs(args);
         string inputPath = cli.InputPath;
         string outputPath = string.IsNullOrEmpty(inputPath) ? "" : cli.OutputPath;
+        bool inputIsLocalFile = !string.IsNullOrEmpty(inputPath) && File.Exists(inputPath);
         MediaInfo info = new MediaInfo
         {
             Path = inputPath,
             Screenshot = outputPath,
+            IsLocalInput = inputIsLocalFile,
             JsonOutput = cli.JsonOutput,
             SkipScreenshot = cli.SkipScreenshot,
             DebugOutput = cli.DebugOutput
@@ -85,15 +90,43 @@ class Program
             FfmpegLogs.Clear();
             DebugLogs.Clear();
             info.NativeLog = "";
-            DebugLog(info, "⚙️ 选项: json=" + cli.JsonOutput + ", no-screenshot=" + cli.SkipScreenshot + ", debug=" + cli.DebugOutput);
+            DebugLog(info, "⚙️ 选项: json=" + cli.JsonOutput +
+                ", no-screenshot=" + cli.SkipScreenshot +
+                ", debug=" + cli.DebugOutput +
+                ", max-probe-size=" + (cli.MaxProbeBytes > 0 ? ToSize(cli.MaxProbeBytes) : "default") +
+                ", max-analyze-seconds=" + (cli.MaxAnalyzeSeconds > 0 ? cli.MaxAnalyzeSeconds.ToString("0.###", CultureInfo.InvariantCulture) : "default") +
+                ", max-read-size=" + (cli.MaxReadBytes > 0 ? ToSize(cli.MaxReadBytes) : "default") +
+                ", max-read-seconds=" + (cli.MaxReadSeconds > 0 ? cli.MaxReadSeconds.ToString("0.###", CultureInfo.InvariantCulture) : "default"));
             DebugLog(info, "🚀 启动解析流程");
             av_log_set_callback(LogCallbackDelegate);
             av_log_set_level(AV_LOG_QUIET);
             avformat_network_init();
 
             av_dict_set(ref options, "scan_all_pmts", "1", 0);
-            av_dict_set(ref options, "probesize", "50000000", 0);
-            av_dict_set(ref options, "analyzeduration", "10000000", 0);
+            long probeBytes = ResolveProbeBytes(cli, inputIsLocalFile);
+            double analyzeSeconds = ResolveAnalyzeSeconds(cli, inputIsLocalFile);
+            av_dict_set(ref options, "probesize", probeBytes.ToString(CultureInfo.InvariantCulture), 0);
+            long analyzeUs = (long)(analyzeSeconds * 1_000_000.0);
+            av_dict_set(ref options, "analyzeduration", analyzeUs.ToString(CultureInfo.InvariantCulture), 0);
+            if (cli.SkipScreenshot)
+            {
+                av_dict_set(ref options, "max_probe_packets", "2500", 0);
+                av_dict_set(ref options, "fpsprobesize", "0", 0);
+            }
+            DebugLog(info, "⚡ 探测预算: probesize=" + ToSize(probeBytes) + ", analyzeduration=" + analyzeSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s");
+
+            if (!inputIsLocalFile)
+            {
+                long timeoutUs = ResolveNetworkTimeoutUs(cli, inputIsLocalFile);
+                if (timeoutUs > 0)
+                {
+                    string timeoutValue = timeoutUs.ToString(CultureInfo.InvariantCulture);
+                    av_dict_set(ref options, "rw_timeout", timeoutValue, 0);
+                    av_dict_set(ref options, "stimeout", timeoutValue, 0);
+                    av_dict_set(ref options, "timeout", timeoutValue, 0);
+                    DebugLog(info, "⏱️ 网络超时: " + (timeoutUs / 1_000_000.0).ToString("0.###", CultureInfo.InvariantCulture) + "s");
+                }
+            }
 
             if (!string.IsNullOrEmpty(cli.Error))
             {
@@ -105,19 +138,20 @@ class Program
             if (string.IsNullOrEmpty(inputPath))
             {
                 DebugLog(info, "❌ 未提供输入文件");
-                info.Error = "Usage: decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug]";
+                info.Error = "Usage: decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug] [--max-probe-size <size>] [--max-analyze-seconds <sec>] [--max-read-size <size>] [--max-read-seconds <sec>]";
                 return PrintMediaInfoAndReturn(info, 1);
             }
 
-            if (!File.Exists(inputPath))
+            if (inputIsLocalFile)
             {
-                DebugLog(info, "❌ 文件不存在: " + inputPath);
-                info.Error = $"File not found: {inputPath}";
-                return PrintMediaInfoAndReturn(info, 1);
+                DebugLog(info, "📂 输入文件: " + inputPath);
+                info.General.FileSizeBytes = new FileInfo(inputPath).Length;
+                DebugLog(info, "📏 文件大小: " + ToSize(info.General.FileSizeBytes));
             }
-            info.General.FileSizeBytes = new FileInfo(inputPath).Length;
-            DebugLog(info, "📂 输入文件: " + inputPath);
-            DebugLog(info, "📏 文件大小: " + ToSize(info.General.FileSizeBytes));
+            else
+            {
+                DebugLog(info, "🌐 输入源: " + inputPath);
+            }
 
             if (!cli.DebugOutput)
             {
@@ -172,14 +206,40 @@ class Program
                 frame = av_frame_alloc();
                 if (packet == IntPtr.Zero || frame == IntPtr.Zero) throw new Exception("alloc packet/frame failed.");
 
+                long decodeMaxBytes = ResolveDecodeMaxBytes(cli, inputIsLocalFile);
+                double decodeMaxSeconds = ResolveDecodeMaxSeconds(cli, inputIsLocalFile);
+                if (decodeMaxBytes > 0 || decodeMaxSeconds > 0)
+                {
+                    string limitText = "🎯 解码预算: ";
+                    if (decodeMaxBytes > 0) limitText += "max-read-size=" + ToSize(decodeMaxBytes) + " ";
+                    if (decodeMaxSeconds > 0) limitText += "max-read-seconds=" + decodeMaxSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s";
+                    DebugLog(info, limitText.Trim());
+                }
                 DebugLog(info, "🎞️ 尝试解码首帧");
-                gotFrame = DecodeFirstFrame(formatCtx, codecCtx, packet, frame, videoStreamIndex);
+                gotFrame = DecodeFirstFrame(formatCtx, codecCtx, packet, frame, videoStreamIndex, decodeMaxBytes, decodeMaxSeconds, info);
                 srcFrame = gotFrame ? Marshal.PtrToStructure<AVFrame>(frame) : default;
                 info.Decoder = selected.Name;
                 DebugLog(info, gotFrame ? "✅ 成功解码到视频帧" : "⚠️ 未解码到可用视频帧");
             }
             else
             {
+                long sampleMaxBytes = ResolveDecodeMaxBytes(cli, inputIsLocalFile);
+                double sampleMaxSeconds = ResolveDecodeMaxSeconds(cli, inputIsLocalFile);
+                AVFormatContext fmtCurrent = Marshal.PtrToStructure<AVFormatContext>(formatCtx);
+                bool needsBitrateSampling = fmtCurrent.bit_rate <= 0;
+                if (!inputIsLocalFile && needsBitrateSampling && (sampleMaxBytes > 0 || sampleMaxSeconds > 0))
+                {
+                    if (packet == IntPtr.Zero) packet = av_packet_alloc();
+                    if (packet != IntPtr.Zero)
+                    {
+                        DebugLog(info, "📡 无截图模式：进行短时包采样以估算码率");
+                        SampleBitrateFromPackets(formatCtx, packet, sampleMaxBytes, sampleMaxSeconds, info);
+                    }
+                }
+                else if (!inputIsLocalFile && !needsBitrateSampling)
+                {
+                    DebugLog(info, "ℹ️ 容器已提供 overall 码率，跳过额外采样");
+                }
                 DebugLog(info, "⏭️ 跳过解码与截图 (--no-screenshot)");
             }
 
@@ -270,6 +330,66 @@ class Program
                 options.OutputPath = args[++i];
                 continue;
             }
+            if (arg.Equals("--max-probe-size", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length)
+                {
+                    options.Error = "Missing value for --max-probe-size.";
+                    return options;
+                }
+                if (!TryParseSizeToBytes(args[++i], out long value) || value <= 0)
+                {
+                    options.Error = "Invalid --max-probe-size value.";
+                    return options;
+                }
+                options.MaxProbeBytes = value;
+                continue;
+            }
+            if (arg.Equals("--max-analyze-seconds", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length)
+                {
+                    options.Error = "Missing value for --max-analyze-seconds.";
+                    return options;
+                }
+                if (!TryParsePositiveDouble(args[++i], out double value))
+                {
+                    options.Error = "Invalid --max-analyze-seconds value.";
+                    return options;
+                }
+                options.MaxAnalyzeSeconds = value;
+                continue;
+            }
+            if (arg.Equals("--max-read-size", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length)
+                {
+                    options.Error = "Missing value for --max-read-size.";
+                    return options;
+                }
+                if (!TryParseSizeToBytes(args[++i], out long value) || value <= 0)
+                {
+                    options.Error = "Invalid --max-read-size value.";
+                    return options;
+                }
+                options.MaxReadBytes = value;
+                continue;
+            }
+            if (arg.Equals("--max-read-seconds", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length)
+                {
+                    options.Error = "Missing value for --max-read-seconds.";
+                    return options;
+                }
+                if (!TryParsePositiveDouble(args[++i], out double value))
+                {
+                    options.Error = "Invalid --max-read-seconds value.";
+                    return options;
+                }
+                options.MaxReadSeconds = value;
+                continue;
+            }
             if (arg.StartsWith("--", StringComparison.Ordinal))
             {
                 options.Error = "Unknown option: " + arg;
@@ -283,19 +403,182 @@ class Program
             options.Error = "Too many positional arguments.";
             return options;
         }
-        if (!string.IsNullOrEmpty(options.InputPath) && File.Exists(options.InputPath))
+        bool inputIsLocalFile = !string.IsNullOrEmpty(options.InputPath) && File.Exists(options.InputPath);
+        if (inputIsLocalFile)
         {
             options.InputPath = ToAbsolutePath(options.InputPath);
         }
         if (!string.IsNullOrEmpty(options.InputPath) && string.IsNullOrEmpty(options.OutputPath))
         {
-            options.OutputPath = options.InputPath + ".png";
+            options.OutputPath = BuildDefaultScreenshotPath(options.InputPath, inputIsLocalFile);
         }
         else if (!string.IsNullOrEmpty(options.OutputPath))
         {
             options.OutputPath = ToAbsolutePath(options.OutputPath);
         }
         return options;
+    }
+
+    private static bool TryParsePositiveDouble(string text, out double value)
+    {
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && value > 0)
+            return true;
+        value = 0;
+        return false;
+    }
+
+    private static bool TryParseSizeToBytes(string text, out long bytes)
+    {
+        bytes = 0;
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        string s = text.Trim().ToUpperInvariant();
+        long unit = 1;
+        if (s.EndsWith("KB", StringComparison.Ordinal))
+        {
+            unit = 1024;
+            s = s[..^2];
+        }
+        else if (s.EndsWith("MB", StringComparison.Ordinal))
+        {
+            unit = 1024L * 1024L;
+            s = s[..^2];
+        }
+        else if (s.EndsWith("GB", StringComparison.Ordinal))
+        {
+            unit = 1024L * 1024L * 1024L;
+            s = s[..^2];
+        }
+        else if (s.EndsWith("K", StringComparison.Ordinal))
+        {
+            unit = 1024;
+            s = s[..^1];
+        }
+        else if (s.EndsWith("M", StringComparison.Ordinal))
+        {
+            unit = 1024L * 1024L;
+            s = s[..^1];
+        }
+        else if (s.EndsWith("G", StringComparison.Ordinal))
+        {
+            unit = 1024L * 1024L * 1024L;
+            s = s[..^1];
+        }
+        else if (s.EndsWith("B", StringComparison.Ordinal))
+        {
+            unit = 1;
+            s = s[..^1];
+        }
+
+        if (!double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out double number) || number <= 0)
+            return false;
+        double raw = number * unit;
+        if (raw > long.MaxValue) return false;
+        bytes = (long)Math.Round(raw);
+        return bytes > 0;
+    }
+
+    private static string BuildDefaultScreenshotPath(string inputPath, bool inputIsLocalFile)
+    {
+        if (inputIsLocalFile)
+        {
+            return inputPath + ".png";
+        }
+
+        string baseName = ExtractFileNameFromInput(inputPath);
+        if (string.IsNullOrWhiteSpace(baseName)) baseName = "screenshot";
+        string fileName = baseName + ".png";
+        return ToAbsolutePath(fileName);
+    }
+
+    private static string ExtractFileNameFromInput(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return "screenshot";
+
+        string candidate = "";
+        if (Uri.TryCreate(input, UriKind.Absolute, out Uri? uri) && !string.IsNullOrEmpty(uri.Scheme))
+        {
+            try
+            {
+                candidate = Uri.UnescapeDataString(Path.GetFileName(uri.AbsolutePath ?? ""));
+            }
+            catch
+            {
+                candidate = Path.GetFileName(uri.AbsolutePath ?? "");
+            }
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                candidate = uri.Host;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            string plain = input;
+            int q = plain.IndexOf('?');
+            if (q >= 0) plain = plain[..q];
+            int hash = plain.IndexOf('#');
+            if (hash >= 0) plain = plain[..hash];
+            plain = plain.TrimEnd('/', '\\');
+            int slash = Math.Max(plain.LastIndexOf('/'), plain.LastIndexOf('\\'));
+            candidate = slash >= 0 ? plain[(slash + 1)..] : plain;
+        }
+        candidate = SanitizeFileName(candidate);
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            candidate = "screenshot";
+        }
+        return candidate;
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        char[] invalid = Path.GetInvalidFileNameChars();
+        StringBuilder sb = new StringBuilder(value.Length);
+        foreach (char c in value)
+        {
+            if (Array.IndexOf(invalid, c) >= 0 || c == '/' || c == '\\' || char.IsControl(c))
+                sb.Append('_');
+            else
+                sb.Append(c);
+        }
+        string result = sb.ToString().Trim();
+        if (result.EndsWith(".", StringComparison.Ordinal)) result = result.TrimEnd('.');
+        return result;
+    }
+
+    private static long ResolveProbeBytes(CliOptions cli, bool inputIsLocalFile)
+    {
+        if (cli.MaxProbeBytes > 0) return cli.MaxProbeBytes;
+        if (inputIsLocalFile) return cli.SkipScreenshot ? 20L * 1024L * 1024L : 50L * 1024L * 1024L;
+        return cli.SkipScreenshot ? 8L * 1024L * 1024L : 20L * 1024L * 1024L;
+    }
+
+    private static double ResolveAnalyzeSeconds(CliOptions cli, bool inputIsLocalFile)
+    {
+        if (cli.MaxAnalyzeSeconds > 0) return cli.MaxAnalyzeSeconds;
+        if (inputIsLocalFile) return cli.SkipScreenshot ? 3.0 : 10.0;
+        return cli.SkipScreenshot ? 2.0 : 5.0;
+    }
+
+    private static long ResolveDecodeMaxBytes(CliOptions cli, bool inputIsLocalFile)
+    {
+        if (cli.MaxReadBytes > 0) return cli.MaxReadBytes;
+        if (inputIsLocalFile) return 0;
+        return cli.SkipScreenshot ? 8L * 1024L * 1024L : 64L * 1024L * 1024L;
+    }
+
+    private static double ResolveDecodeMaxSeconds(CliOptions cli, bool inputIsLocalFile)
+    {
+        if (cli.MaxReadSeconds > 0) return cli.MaxReadSeconds;
+        if (inputIsLocalFile) return 0;
+        return cli.SkipScreenshot ? 3.0 : 15.0;
+    }
+
+    private static long ResolveNetworkTimeoutUs(CliOptions cli, bool inputIsLocalFile)
+    {
+        double timeoutSec = ResolveDecodeMaxSeconds(cli, inputIsLocalFile);
+        long us = (long)Math.Round(timeoutSec * 1_000_000.0);
+        return us > 0 ? us : 0;
     }
 
     private static string ToAbsolutePath(string path)
@@ -352,11 +635,26 @@ class Program
         return result;
     }
 
-    private static bool DecodeFirstFrame(IntPtr formatCtx, IntPtr codecCtx, IntPtr packet, IntPtr frame, int videoStreamIndex)
+    private static bool DecodeFirstFrame(IntPtr formatCtx, IntPtr codecCtx, IntPtr packet, IntPtr frame, int videoStreamIndex, long maxReadBytes, double maxReadSeconds, MediaInfo info)
     {
+        ReadStatAccumulator stats = new ReadStatAccumulator();
+        Stopwatch sw = Stopwatch.StartNew();
         while (av_read_frame(formatCtx, packet) >= 0)
         {
             AVPacket pkt = Marshal.PtrToStructure<AVPacket>(packet);
+            stats.AddPacket(formatCtx, pkt);
+            if (maxReadBytes > 0 && stats.TotalBytes > maxReadBytes)
+            {
+                DebugLog(info, "⛔ 达到读取上限: " + ToSize(stats.TotalBytes) + " > " + ToSize(maxReadBytes));
+                av_packet_unref(packet);
+                break;
+            }
+            if (maxReadSeconds > 0 && sw.Elapsed.TotalSeconds > maxReadSeconds)
+            {
+                DebugLog(info, "⛔ 达到读取时长上限: " + sw.Elapsed.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s > " + maxReadSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s");
+                av_packet_unref(packet);
+                break;
+            }
             if (pkt.stream_index == videoStreamIndex)
             {
                 int ret = avcodec_send_packet(codecCtx, packet);
@@ -370,6 +668,8 @@ class Program
                     ret = avcodec_receive_frame(codecCtx, frame);
                     if (ret == AVERROR_EAGAIN || ret == AVERROR_EOF) break;
                     if (ret < 0) break;
+                    DebugLog(info, "✅ 解码首帧成功，立即停止读取");
+                    if (!info.IsLocalInput) ApplyObservedBitrate(info, stats, sw.Elapsed.TotalSeconds);
                     av_packet_unref(packet);
                     return true;
                 }
@@ -377,14 +677,157 @@ class Program
             av_packet_unref(packet);
         }
 
+        if (!info.IsLocalInput) ApplyObservedBitrate(info, stats, sw.Elapsed.TotalSeconds);
         if (avcodec_send_packet(codecCtx, IntPtr.Zero) < 0) return false;
         while (true)
         {
             int flushRet = avcodec_receive_frame(codecCtx, frame);
-            if (flushRet == 0) return true;
+            if (flushRet == 0)
+            {
+                DebugLog(info, "✅ Flush 解码得到首帧");
+                return true;
+            }
             if (flushRet == AVERROR_EAGAIN || flushRet == AVERROR_EOF) return false;
             if (flushRet < 0) return false;
         }
+    }
+
+    private static void SampleBitrateFromPackets(IntPtr formatCtx, IntPtr packet, long maxReadBytes, double maxReadSeconds, MediaInfo info)
+    {
+        ReadStatAccumulator stats = new ReadStatAccumulator();
+        Stopwatch sw = Stopwatch.StartNew();
+        while (av_read_frame(formatCtx, packet) >= 0)
+        {
+            AVPacket pkt = Marshal.PtrToStructure<AVPacket>(packet);
+            stats.AddPacket(formatCtx, pkt);
+            av_packet_unref(packet);
+
+            if (maxReadBytes > 0 && stats.TotalBytes > maxReadBytes)
+            {
+                DebugLog(info, "⛔ 采样达到读取上限: " + ToSize(stats.TotalBytes) + " > " + ToSize(maxReadBytes));
+                break;
+            }
+            if (maxReadSeconds > 0 && sw.Elapsed.TotalSeconds > maxReadSeconds)
+            {
+                DebugLog(info, "⛔ 采样达到时长上限: " + sw.Elapsed.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s > " + maxReadSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s");
+                break;
+            }
+            if (stats.DurationSeconds >= 1.0 && stats.TotalBytes >= 512 * 1024)
+            {
+                DebugLog(info, "✅ 采样已获得可用时间轴与数据量，提前结束");
+                break;
+            }
+        }
+        ApplyObservedBitrate(info, stats, sw.Elapsed.TotalSeconds);
+    }
+
+    private static void ApplyObservedBitrate(MediaInfo info, ReadStatAccumulator stats, double fallbackSeconds)
+    {
+        long overall = stats.GetOverallBitrate(fallbackSeconds);
+        if (overall > 0 && overall > info.ObservedOverallBitrate)
+            info.ObservedOverallBitrate = overall;
+
+        foreach (var kv in stats.GetStreamBitrates(fallbackSeconds))
+        {
+            if (kv.Value <= 0) continue;
+            if (!info.ObservedStreamBitrates.TryGetValue(kv.Key, out long old) || kv.Value > old)
+                info.ObservedStreamBitrates[kv.Key] = kv.Value;
+        }
+    }
+
+    private sealed class ReadStatAccumulator
+    {
+        public long TotalBytes { get; private set; }
+        public double DurationSeconds => HasTimeline && MaxUs > MinUs ? (MaxUs - MinUs) / 1_000_000.0 : 0.0;
+
+        private bool HasTimeline;
+        private long MinUs = long.MaxValue;
+        private long MaxUs = long.MinValue;
+        private readonly Dictionary<int, StreamStat> StreamStats = new Dictionary<int, StreamStat>();
+
+        public void AddPacket(IntPtr formatCtx, AVPacket pkt)
+        {
+            int size = pkt.size > 0 ? pkt.size : 0;
+            TotalBytes += size;
+            int streamIndex = pkt.stream_index;
+            if (streamIndex < 0) return;
+
+            if (!StreamStats.TryGetValue(streamIndex, out StreamStat? ss) || ss == null)
+            {
+                ss = new StreamStat();
+                StreamStats[streamIndex] = ss;
+            }
+            ss.Bytes += size;
+
+            if (!TryResolvePacketTimeRangeUs(formatCtx, pkt, out long startUs, out long endUs))
+                return;
+
+            ss.HasTimeline = true;
+            if (startUs < ss.MinUs) ss.MinUs = startUs;
+            if (endUs > ss.MaxUs) ss.MaxUs = endUs;
+
+            HasTimeline = true;
+            if (startUs < MinUs) MinUs = startUs;
+            if (endUs > MaxUs) MaxUs = endUs;
+        }
+
+        public long GetOverallBitrate(double fallbackSeconds)
+        {
+            if (TotalBytes <= 0) return 0;
+            double seconds = DurationSeconds > 0 ? DurationSeconds : fallbackSeconds;
+            if (seconds <= 0) return 0;
+            return (long)(TotalBytes * 8.0 / seconds);
+        }
+
+        public Dictionary<int, long> GetStreamBitrates(double fallbackSeconds)
+        {
+            Dictionary<int, long> result = new Dictionary<int, long>();
+            foreach (var kv in StreamStats)
+            {
+                StreamStat ss = kv.Value;
+                if (ss.Bytes <= 0) continue;
+                double seconds = ss.HasTimeline && ss.MaxUs > ss.MinUs ? (ss.MaxUs - ss.MinUs) / 1_000_000.0 : fallbackSeconds;
+                if (seconds <= 0) continue;
+                long bitrate = (long)(ss.Bytes * 8.0 / seconds);
+                if (bitrate > 0) result[kv.Key] = bitrate;
+            }
+            return result;
+        }
+    }
+
+    private sealed class StreamStat
+    {
+        public long Bytes;
+        public bool HasTimeline;
+        public long MinUs = long.MaxValue;
+        public long MaxUs = long.MinValue;
+    }
+
+    private static bool TryResolvePacketTimeRangeUs(IntPtr formatCtxPtr, AVPacket pkt, out long startUs, out long endUs)
+    {
+        startUs = 0;
+        endUs = 0;
+        if (pkt.stream_index < 0) return false;
+        int streamIndex = pkt.stream_index;
+
+        AVFormatContext fmt = Marshal.PtrToStructure<AVFormatContext>(formatCtxPtr);
+        if (streamIndex >= (int)fmt.nb_streams) return false;
+        IntPtr sp = Marshal.ReadIntPtr(fmt.streams, streamIndex * IntPtr.Size);
+        if (sp == IntPtr.Zero) return false;
+        AVStream stream = Marshal.PtrToStructure<AVStream>(sp);
+        double tb = Q2d(stream.time_base);
+        if (tb <= 0) return false;
+
+        long ts = pkt.pts != AV_NOPTS_VALUE ? pkt.pts : pkt.dts;
+        if (ts == AV_NOPTS_VALUE) return false;
+
+        startUs = (long)Math.Round(ts * tb * 1_000_000.0);
+        long durationUs = 0;
+        if (pkt.duration > 0)
+            durationUs = (long)Math.Round(pkt.duration * tb * 1_000_000.0);
+        endUs = durationUs > 0 ? startUs + durationUs : startUs;
+        if (endUs < startUs) endUs = startUs;
+        return true;
     }
 
     private static void BuildMediaInfo(MediaInfo info, IntPtr formatCtxPtr, int decodedVideoStreamIndex, AVFrame decodedFrame, bool hasDecodedFrame)
@@ -402,9 +845,13 @@ class Program
         {
             Format = formatName,
             DurationSeconds = fmt.duration > 0 ? fmt.duration / 1000000.0 : 0,
-            OverallBitrate = fmt.bit_rate > 0 ? fmt.bit_rate : 0,
+            OverallBitrate = fmt.bit_rate > 0 ? fmt.bit_rate : (!info.IsLocalInput ? info.ObservedOverallBitrate : 0),
             FileSizeBytes = fileSizeBytes
         };
+        if (!info.IsLocalInput && fmt.bit_rate <= 0 && info.General.OverallBitrate > 0)
+        {
+            DebugLog(info, "📈 Overall 码率使用观测值: " + ToBitrate(info.General.OverallBitrate));
+        }
         info.Video.Clear();
         info.Audio.Clear();
 
@@ -485,7 +932,7 @@ class Program
                     Width = width,
                     Height = height,
                     FrameRate = fpsVal > 0 ? fpsVal : 0,
-                    Bitrate = cp.bit_rate > 0 ? cp.bit_rate : 0,
+                    Bitrate = cp.bit_rate > 0 ? cp.bit_rate : (!info.IsLocalInput ? GetObservedStreamBitrate(info, s.index) : 0),
                     HdrStatus = hdr.Status,
                     HdrType = hdr.Type,
                     ColorTransfer = resolvedTrc,
@@ -511,8 +958,8 @@ class Program
                     DurationSeconds = streamDuration,
                     MenuId = menuId,
                     Channels = ch,
-                    BitrateMode = cp.bit_rate > 0 ? "Constant" : "",
-                    Bitrate = cp.bit_rate > 0 ? cp.bit_rate : 0,
+                    BitrateMode = cp.bit_rate > 0 ? "Constant" : (!info.IsLocalInput && GetObservedStreamBitrate(info, s.index) > 0 ? "Estimated" : ""),
+                    Bitrate = cp.bit_rate > 0 ? cp.bit_rate : (!info.IsLocalInput ? GetObservedStreamBitrate(info, s.index) : 0),
                 };
                 info.Audio.Add(at);
             }
@@ -554,6 +1001,14 @@ class Program
         }
     }
 
+    private static long GetObservedStreamBitrate(MediaInfo info, int streamIndex)
+    {
+        if (streamIndex < 0) return 0;
+        if (info.ObservedStreamBitrates.TryGetValue(streamIndex, out long bitrate) && bitrate > 0)
+            return bitrate;
+        return 0;
+    }
+
     private static HdrDecision DetectHdr(int colorTrc, int colorPrimaries, int colorSpace, int bitDepth, string source)
     {
         if (colorTrc == AVCOL_TRC_SMPTE2084) return new HdrDecision(HdrStatus.Yes, "PQ", source + ": trc=SMPTE2084(PQ) => HDR=是");
@@ -589,9 +1044,13 @@ class Program
             colorTrc == AVCOL_TRC_SMPTE240M;
         if (explicitSdrTrc)
         {
+            bool explicitBt709Primaries = colorPrimaries == AVCOL_PRI_BT709;
+            bool explicitBt709Matrix = colorSpace == AVCOL_SPC_BT709;
+            if (explicitBt709Primaries && (explicitBt709Matrix || colorSpace == AVCOL_SPC_UNSPECIFIED || colorSpace == AVCOL_SPC_RESERVED0 || colorSpace == AVCOL_SPC_RESERVED))
+                return new HdrDecision(HdrStatus.No, "", source + ": trc/primaries为BT.709 => HDR=否");
             // 显式 SDR 也可能来自缺失/错误元数据，避免误判为“否”。
             if (!hasBitDepth)
-                return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=SDR但bitDepth缺失 => HDR=未知");
+                return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=SDR但bitDepth缺失且无明确BT.709依据 => HDR=未知");
             if (is10BitOrAbove || hasWideGamutHint || colorSpace == AVCOL_SPC_YCGCO)
                 return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=SDR但存在10bit/广色域线索 => HDR=未知");
             return new HdrDecision(HdrStatus.No, "", source + ": trc=明确SDR且8bit常规色域 => HDR=否");
@@ -649,7 +1108,7 @@ class Program
         if (codecpar.Status == HdrStatus.No && frame.Status == HdrStatus.Unknown)
             return new HdrDecision(HdrStatus.No, "", "codecpar+decoded-frame: codecpar已明确SDR，忽略decoded-frame未知");
         if (codecpar.Status == HdrStatus.Unknown && frame.Status == HdrStatus.No)
-            return new HdrDecision(HdrStatus.Unknown, "", "codecpar+decoded-frame: 仅decoded-frame判为SDR，保守输出未知");
+            return new HdrDecision(HdrStatus.No, "", "codecpar+decoded-frame: decoded-frame已明确SDR，判定HDR=否");
         if (codecpar.Status == HdrStatus.Unknown || frame.Status == HdrStatus.Unknown)
             return new HdrDecision(HdrStatus.Unknown, "", "codecpar+decoded-frame: 至少一侧信息不足，判定HDR=未知");
         return codecpar;
@@ -834,7 +1293,7 @@ class Program
             overallBitrate = (long)(info.General.FileSizeBytes * 8 / durationSeconds);
 
         List<string> lines = new();
-        lines.Add("📂 文件：" + info.Path);
+        lines.Add((info.IsLocalInput ? "📂 文件：" : "🌐 输入源：") + info.Path);
         lines.Add("├─ 📊 概况");
         if (!string.IsNullOrEmpty(info.General.Format)) lines.Add("│  格式：" + NormalizeContainerFormat(info.General.Format));
         if (info.General.FileSizeBytes > 0) lines.Add("│  大小：" + ToSize(info.General.FileSizeBytes));
@@ -940,6 +1399,8 @@ class Program
         using Utf8JsonWriter writer = new Utf8JsonWriter(stdout, new JsonWriterOptions { Indented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
 
         writer.WriteStartObject();
+        writer.WriteString("input", info.Path);
+        writer.WriteString("inputType", info.IsLocalInput ? "file" : "source");
         writer.WriteString("file", info.Path);
         if (!string.IsNullOrEmpty(info.Decoder)) writer.WriteString("decoder", info.Decoder);
 
@@ -1760,6 +2221,7 @@ class Program
     private class MediaInfo
     {
         public string Path { get; set; } = "";
+        public bool IsLocalInput { get; set; } = true;
         public string Decoder { get; set; } = "";
         public string Screenshot { get; set; } = "";
         public bool ScreenshotSaved { get; set; }
@@ -1768,6 +2230,8 @@ class Program
         public bool DebugOutput { get; set; }
         public string NativeLog { get; set; } = "";
         public string Error { get; set; } = "";
+        public long ObservedOverallBitrate { get; set; }
+        public Dictionary<int, long> ObservedStreamBitrates { get; set; } = new Dictionary<int, long>();
         public GeneralInfo General { get; set; } = new GeneralInfo();
         public List<VideoTrack> Video { get; set; } = new List<VideoTrack>();
         public List<AudioTrack> Audio { get; set; } = new List<AudioTrack>();
@@ -1780,6 +2244,10 @@ class Program
         public bool SkipScreenshot { get; set; }
         public bool JsonOutput { get; set; }
         public bool DebugOutput { get; set; }
+        public long MaxProbeBytes { get; set; }
+        public double MaxAnalyzeSeconds { get; set; }
+        public long MaxReadBytes { get; set; }
+        public double MaxReadSeconds { get; set; }
         public string Error { get; set; } = "";
     }
 
