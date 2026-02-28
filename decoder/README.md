@@ -1,6 +1,6 @@
 # decoder
 
-基于 FFmpeg 的媒体信息读取工具，可输出：
+基于 FFmpeg(7.0+) 的媒体信息读取工具，可输出：
 - 中文树状摘要（默认）
 - 纯 JSON（便于第三方解析）
 
@@ -23,7 +23,7 @@ decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug]
 - `--json`
   输出纯 JSON（UTF-8，中文直出）
 - `--debug`
-  输出实时调试步骤（带 emoji），并保留解码器原始输出
+  输出实时调试步骤（带 emoji），并保留解码器原始输出；包含 HDR 判定链路（`trc/primaries/matrix/bitDepth` 原始值与来源合并结果）
 
 ## 使用示例
 
@@ -95,6 +95,7 @@ JSON 顶层字段：
 - `decoder`（有解码时）
 - `general`
 - `video`（数组）
+  - 每路视频包含 `hdrStatus/hdrType`、`bitDepth`、`color`（`transfer/primaries/matrix` 及对应 `*Id`）
 - `audio`（数组）
 - `screenshot`：`{ skipped, saved, path }`
 - `debug`（启用 `--debug` 时）

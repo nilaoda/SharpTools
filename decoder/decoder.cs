@@ -20,6 +20,30 @@ class Program
     private const int AV_LOG_WARNING = 24;
     private const int AV_LOG_QUIET = -8;
     private const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+    private const int AVCOL_TRC_RESERVED0 = 0;
+    private const int AVCOL_TRC_BT709 = 1;
+    private const int AVCOL_TRC_UNSPECIFIED = 2;
+    private const int AVCOL_TRC_RESERVED = 3;
+    private const int AVCOL_TRC_GAMMA22 = 4;
+    private const int AVCOL_TRC_GAMMA28 = 5;
+    private const int AVCOL_TRC_SMPTE170M = 6;
+    private const int AVCOL_TRC_SMPTE240M = 7;
+    private const int AVCOL_TRC_BT2020_10 = 14;
+    private const int AVCOL_TRC_BT2020_12 = 15;
+    private const int AVCOL_TRC_SMPTE2084 = 16;
+    private const int AVCOL_TRC_ARIB_STD_B67 = 18;
+    private const int AVCOL_PRI_RESERVED0 = 0;
+    private const int AVCOL_PRI_BT709 = 1;
+    private const int AVCOL_PRI_UNSPECIFIED = 2;
+    private const int AVCOL_PRI_BT2020 = 9;
+    private const int AVCOL_SPC_RESERVED0 = 0;
+    private const int AVCOL_SPC_BT709 = 1;
+    private const int AVCOL_SPC_UNSPECIFIED = 2;
+    private const int AVCOL_SPC_RESERVED = 3;
+    private const int AVCOL_SPC_YCGCO = 8;
+    private const int AVCOL_SPC_BT2020_NCL = 9;
+    private const int AVCOL_SPC_BT2020_CL = 10;
+    private const int AVCOL_SPC_ICTCP = 14;
 
     private static readonly HashSet<string> HardwareTags = new()
     {
@@ -408,6 +432,48 @@ class Program
                 }
                 string codecName = PtrToString(avcodec_get_name(cp.codec_id));
                 if (streamDuration <= 0) streamDuration = info.General.DurationSeconds;
+                IntPtr cpPixFmtNamePtr = av_get_pix_fmt_name(cp.format);
+                string cpPixFmtName = PtrToString(cpPixFmtNamePtr);
+                int bitDepth = ResolveBitDepth(cp.bits_per_raw_sample, cp.bits_per_coded_sample, cpPixFmtName);
+                DebugLog(info, "🌈 色彩来源[视频ID " + streamId + "] codecpar: trc=" + cp.color_trc + "(" + ColorTransferName(cp.color_trc) + ")" +
+                    ", primaries=" + cp.color_primaries + "(" + ColorPrimariesName(cp.color_primaries) + ")" +
+                    ", matrix=" + cp.color_space + "(" + ColorSpaceName(cp.color_space) + ")" +
+                    ", bitDepth=" + bitDepth + " (raw=" + cp.bits_per_raw_sample + ", coded=" + cp.bits_per_coded_sample + ", pix_fmt=" + cp.format + "/" + cpPixFmtName + ")");
+
+                HdrDecision codecparHdr = DetectHdr(cp.color_trc, cp.color_primaries, cp.color_space, bitDepth, "codecpar");
+                HdrDecision hdr = codecparHdr;
+                DebugLog(info, "🌈 HDR判定[视频ID " + streamId + "] " + codecparHdr.Reason);
+
+                int resolvedTrc = cp.color_trc;
+                int resolvedPrimaries = cp.color_primaries;
+                int resolvedMatrix = cp.color_space;
+                int resolvedBitDepth = bitDepth;
+                if (hasDecodedFrame && s.index == decodedVideoStreamIndex)
+                {
+                    IntPtr framePixFmtNamePtr = av_get_pix_fmt_name(decodedFrame.format);
+                    string framePixFmtName = PtrToString(framePixFmtNamePtr);
+                    int frameBitDepth = ResolveBitDepth(0, 0, framePixFmtName);
+                    if (frameBitDepth <= 0) frameBitDepth = bitDepth;
+
+                    DebugLog(info, "🌈 色彩来源[视频ID " + streamId + "] decoded-frame: trc=" + decodedFrame.color_trc + "(" + ColorTransferName(decodedFrame.color_trc) + ")" +
+                        ", primaries=" + decodedFrame.color_primaries + "(" + ColorPrimariesName(decodedFrame.color_primaries) + ")" +
+                        ", matrix=" + decodedFrame.colorspace + "(" + ColorSpaceName(decodedFrame.colorspace) + ")" +
+                        ", bitDepth=" + frameBitDepth + " (pix_fmt=" + decodedFrame.format + "/" + framePixFmtName + ")");
+
+                    HdrDecision frameHdr = DetectHdr(decodedFrame.color_trc, decodedFrame.color_primaries, decodedFrame.colorspace, frameBitDepth, "decoded-frame");
+                    DebugLog(info, "🌈 HDR判定[视频ID " + streamId + "] " + frameHdr.Reason);
+                    hdr = MergeHdrDecision(codecparHdr, frameHdr);
+                    DebugLog(info, "🌈 HDR采用[视频ID " + streamId + "] " + hdr.Reason);
+
+                    resolvedTrc = MergeTransfer(decodedFrame.color_trc, cp.color_trc);
+                    resolvedPrimaries = MergePrimaries(decodedFrame.color_primaries, cp.color_primaries);
+                    resolvedMatrix = MergeMatrix(decodedFrame.colorspace, cp.color_space);
+                    resolvedBitDepth = frameBitDepth > bitDepth ? frameBitDepth : bitDepth;
+                }
+                DebugLog(info, "🌈 色彩采用[视频ID " + streamId + "] trc=" + resolvedTrc + "(" + ColorTransferName(resolvedTrc) + ")" +
+                    ", primaries=" + resolvedPrimaries + "(" + ColorPrimariesName(resolvedPrimaries) + ")" +
+                    ", matrix=" + resolvedMatrix + "(" + ColorSpaceName(resolvedMatrix) + ")" +
+                    ", bitDepth=" + resolvedBitDepth);
 
                 VideoTrack vt = new VideoTrack
                 {
@@ -419,6 +485,12 @@ class Program
                     Height = height,
                     FrameRate = fpsVal > 0 ? fpsVal : 0,
                     Bitrate = cp.bit_rate > 0 ? cp.bit_rate : 0,
+                    HdrStatus = hdr.Status,
+                    HdrType = hdr.Type,
+                    ColorTransfer = resolvedTrc,
+                    ColorPrimaries = resolvedPrimaries,
+                    ColorMatrix = resolvedMatrix,
+                    BitDepth = resolvedBitDepth,
                     SampleAspectRatioNum = sampleAspectRatio.num,
                     SampleAspectRatioDen = sampleAspectRatio.den
                 };
@@ -457,6 +529,9 @@ class Program
             info.General.OverallBitrate = (long)(info.General.FileSizeBytes * 8 / info.General.DurationSeconds);
         }
         EstimateMissingVideoBitrate(info);
+        info.General.HdrStatus = AggregateHdrStatus(info.Video);
+        info.General.HdrType = AggregateHdrType(info.Video, info.General.HdrStatus);
+        DebugLog(info, "🌈 HDR汇总: " + HdrStatusToText(info.General.HdrStatus, info.General.HdrType));
     }
 
     private static void EstimateMissingVideoBitrate(MediaInfo info)
@@ -476,6 +551,247 @@ class Program
         {
             v.Bitrate = perVideo;
         }
+    }
+
+    private static HdrDecision DetectHdr(int colorTrc, int colorPrimaries, int colorSpace, int bitDepth, string source)
+    {
+        if (colorTrc == AVCOL_TRC_SMPTE2084) return new HdrDecision(HdrStatus.Yes, "PQ", source + ": trc=SMPTE2084(PQ) => HDR=是");
+        if (colorTrc == AVCOL_TRC_ARIB_STD_B67) return new HdrDecision(HdrStatus.Yes, "HLG", source + ": trc=ARIB_STD_B67(HLG) => HDR=是");
+
+        bool hasBt2020Primaries = colorPrimaries == AVCOL_PRI_BT2020;
+        bool hasHdrMatrix = colorSpace == AVCOL_SPC_BT2020_NCL || colorSpace == AVCOL_SPC_BT2020_CL || colorSpace == AVCOL_SPC_ICTCP;
+        bool hasWideGamutHint = hasBt2020Primaries || hasHdrMatrix;
+        bool hasBitDepth = bitDepth > 0;
+        bool is10BitOrAbove = bitDepth >= 10;
+        if (hasWideGamutHint && is10BitOrAbove)
+            return new HdrDecision(HdrStatus.Yes, "", source + ": BT.2020/ICtCp + bitDepth>=10 => HDR=是(类型未知)");
+
+        if (colorTrc == AVCOL_TRC_RESERVED0 || colorTrc == AVCOL_TRC_UNSPECIFIED || colorTrc == AVCOL_TRC_RESERVED)
+        {
+            bool sdrLikePrimaries = colorPrimaries == AVCOL_PRI_RESERVED0 || colorPrimaries == AVCOL_PRI_UNSPECIFIED || colorPrimaries == AVCOL_PRI_BT709;
+            bool sdrLikeMatrix =
+                colorSpace == AVCOL_SPC_RESERVED0 ||
+                colorSpace == AVCOL_SPC_UNSPECIFIED ||
+                colorSpace == AVCOL_SPC_RESERVED ||
+                colorSpace == AVCOL_SPC_BT709;
+            if (hasBitDepth && bitDepth <= 8 && sdrLikePrimaries && sdrLikeMatrix)
+                return new HdrDecision(HdrStatus.No, "", source + ": trc未指定/保留 + 8bit + 常规色域 => 视为SDR(HDR=否)");
+            return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=reserved/unspecified 且无充分SDR依据 => HDR=未知");
+        }
+
+        bool explicitSdrTrc =
+            colorTrc == AVCOL_TRC_BT709 ||
+            colorTrc == AVCOL_TRC_GAMMA22 ||
+            colorTrc == AVCOL_TRC_GAMMA28 ||
+            colorTrc == AVCOL_TRC_SMPTE170M ||
+            colorTrc == AVCOL_TRC_SMPTE240M;
+        if (explicitSdrTrc)
+        {
+            // 显式 SDR 也可能来自缺失/错误元数据，避免误判为“否”。
+            if (!hasBitDepth)
+                return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=SDR但bitDepth缺失 => HDR=未知");
+            if (is10BitOrAbove || hasWideGamutHint || colorSpace == AVCOL_SPC_YCGCO)
+                return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=SDR但存在10bit/广色域线索 => HDR=未知");
+            return new HdrDecision(HdrStatus.No, "", source + ": trc=明确SDR且8bit常规色域 => HDR=否");
+        }
+
+        if (colorTrc == AVCOL_TRC_BT2020_10 || colorTrc == AVCOL_TRC_BT2020_12)
+        {
+            if (is10BitOrAbove) return new HdrDecision(HdrStatus.Yes, "", source + ": trc=BT.2020_xx + >=10bit => HDR=是(类型未知)");
+            return new HdrDecision(HdrStatus.Unknown, "", source + ": trc=BT.2020_xx但bitDepth缺失或不足 => HDR=未知");
+        }
+
+        if (is10BitOrAbove && (hasWideGamutHint || colorSpace == AVCOL_SPC_YCGCO))
+            return new HdrDecision(HdrStatus.Unknown, "", source + ": 存在10bit+宽色域/YCoCg线索但缺少HDR传输函数 => HDR=未知");
+
+        return new HdrDecision(HdrStatus.Unknown, "", source + ": 无明确HDR/SDR信号 => HDR=未知");
+    }
+
+    private static int ResolveBitDepth(int bitsPerRawSample, int bitsPerCodedSample, string pixFmtName)
+    {
+        int bitDepth = 0;
+        if (bitsPerRawSample > bitDepth) bitDepth = bitsPerRawSample;
+        if (bitsPerCodedSample > bitDepth) bitDepth = bitsPerCodedSample;
+        int guessed = GuessBitDepthFromPixFmtName(pixFmtName);
+        if (guessed > bitDepth) bitDepth = guessed;
+        return bitDepth;
+    }
+
+    private static int GuessBitDepthFromPixFmtName(string pixFmtName)
+    {
+        if (string.IsNullOrEmpty(pixFmtName)) return 0;
+        string s = pixFmtName.ToLowerInvariant();
+        if (s.Contains("p16")) return 16;
+        if (s.Contains("p14")) return 14;
+        if (s.Contains("p12")) return 12;
+        if (s.Contains("p10")) return 10;
+        if (s.Contains("p9")) return 9;
+        if (s.Contains("p8")) return 8;
+        return 0;
+    }
+
+    private static HdrDecision MergeHdrDecision(HdrDecision codecpar, HdrDecision frame)
+    {
+        if (codecpar.Status == HdrStatus.Yes && frame.Status == HdrStatus.Yes)
+        {
+            string type = !string.IsNullOrEmpty(codecpar.Type) ? codecpar.Type : frame.Type;
+            return new HdrDecision(HdrStatus.Yes, type, "codecpar+decoded-frame: 二者均判定HDR");
+        }
+        if (codecpar.Status == HdrStatus.Yes || frame.Status == HdrStatus.Yes)
+        {
+            HdrDecision yes = codecpar.Status == HdrStatus.Yes ? codecpar : frame;
+            return new HdrDecision(HdrStatus.Yes, yes.Type, "codecpar+decoded-frame: 任一来源判定HDR，采用HDR");
+        }
+        if (codecpar.Status == HdrStatus.No && frame.Status == HdrStatus.No)
+            return new HdrDecision(HdrStatus.No, "", "codecpar+decoded-frame: 二者均明确SDR，判定HDR=否");
+        if (codecpar.Status == HdrStatus.No && frame.Status == HdrStatus.Unknown)
+            return new HdrDecision(HdrStatus.No, "", "codecpar+decoded-frame: codecpar已明确SDR，忽略decoded-frame未知");
+        if (codecpar.Status == HdrStatus.Unknown && frame.Status == HdrStatus.No)
+            return new HdrDecision(HdrStatus.Unknown, "", "codecpar+decoded-frame: 仅decoded-frame判为SDR，保守输出未知");
+        if (codecpar.Status == HdrStatus.Unknown || frame.Status == HdrStatus.Unknown)
+            return new HdrDecision(HdrStatus.Unknown, "", "codecpar+decoded-frame: 至少一侧信息不足，判定HDR=未知");
+        return codecpar;
+    }
+
+    private static bool IsTrcSpecified(int value)
+    {
+        return value != AVCOL_TRC_RESERVED0 && value != AVCOL_TRC_UNSPECIFIED && value != AVCOL_TRC_RESERVED;
+    }
+
+    private static bool IsPrimariesSpecified(int value)
+    {
+        return value != AVCOL_PRI_RESERVED0 && value != AVCOL_PRI_UNSPECIFIED;
+    }
+
+    private static bool IsMatrixSpecified(int value)
+    {
+        return value != AVCOL_SPC_RESERVED0 && value != AVCOL_SPC_UNSPECIFIED && value != AVCOL_SPC_RESERVED;
+    }
+
+    private static int MergeTransfer(int frameValue, int codecparValue)
+    {
+        if (IsTrcSpecified(codecparValue)) return codecparValue;
+        if (IsTrcSpecified(frameValue)) return frameValue;
+        return codecparValue;
+    }
+
+    private static int MergePrimaries(int frameValue, int codecparValue)
+    {
+        if (IsPrimariesSpecified(codecparValue)) return codecparValue;
+        if (IsPrimariesSpecified(frameValue)) return frameValue;
+        return codecparValue;
+    }
+
+    private static int MergeMatrix(int frameValue, int codecparValue)
+    {
+        if (IsMatrixSpecified(codecparValue)) return codecparValue;
+        if (IsMatrixSpecified(frameValue)) return frameValue;
+        return codecparValue;
+    }
+
+    private static string ColorTransferName(int value)
+    {
+        string nativeName = PtrToString(av_color_transfer_name(value));
+        return value switch
+        {
+            AVCOL_TRC_RESERVED0 => "reserved0",
+            AVCOL_TRC_BT709 => "bt709",
+            AVCOL_TRC_UNSPECIFIED => "unspecified",
+            AVCOL_TRC_RESERVED => "reserved",
+            AVCOL_TRC_GAMMA22 => "gamma22",
+            AVCOL_TRC_GAMMA28 => "gamma28",
+            AVCOL_TRC_SMPTE170M => "smpte170m",
+            AVCOL_TRC_SMPTE240M => "smpte240m",
+            AVCOL_TRC_BT2020_10 => "bt2020_10",
+            AVCOL_TRC_BT2020_12 => "bt2020_12",
+            AVCOL_TRC_SMPTE2084 => "smpte2084",
+            AVCOL_TRC_ARIB_STD_B67 => "arib-std-b67",
+            _ => !string.IsNullOrEmpty(nativeName) ? nativeName : "unknown"
+        };
+    }
+
+    private static string ColorPrimariesName(int value)
+    {
+        string nativeName = PtrToString(av_color_primaries_name(value));
+        return value switch
+        {
+            AVCOL_PRI_RESERVED0 => "reserved0",
+            AVCOL_PRI_BT709 => "bt709",
+            AVCOL_PRI_UNSPECIFIED => "unspecified",
+            AVCOL_PRI_BT2020 => "bt2020",
+            _ => !string.IsNullOrEmpty(nativeName) ? nativeName : "unknown"
+        };
+    }
+
+    private static string ColorSpaceName(int value)
+    {
+        string nativeName = PtrToString(av_color_space_name(value));
+        return value switch
+        {
+            AVCOL_SPC_RESERVED0 => "reserved0",
+            AVCOL_SPC_BT709 => "bt709",
+            AVCOL_SPC_UNSPECIFIED => "unspecified",
+            AVCOL_SPC_RESERVED => "reserved",
+            AVCOL_SPC_YCGCO => "ycgco",
+            AVCOL_SPC_BT2020_NCL => "bt2020_ncl",
+            AVCOL_SPC_BT2020_CL => "bt2020_cl",
+            AVCOL_SPC_ICTCP => "ictcp",
+            _ => !string.IsNullOrEmpty(nativeName) ? nativeName : "unknown"
+        };
+    }
+
+    private static HdrStatus AggregateHdrStatus(List<VideoTrack> videos)
+    {
+        if (videos.Count == 0) return HdrStatus.Unknown;
+        bool hasYes = false;
+        bool hasUnknown = false;
+        bool hasNo = false;
+        foreach (var v in videos)
+        {
+            if (v.HdrStatus == HdrStatus.Yes) hasYes = true;
+            else if (v.HdrStatus == HdrStatus.Unknown) hasUnknown = true;
+            else hasNo = true;
+        }
+        if (hasYes) return HdrStatus.Yes;
+        if (hasUnknown) return HdrStatus.Unknown;
+        if (hasNo) return HdrStatus.No;
+        return HdrStatus.Unknown;
+    }
+
+    private static string AggregateHdrType(List<VideoTrack> videos, HdrStatus status)
+    {
+        if (status != HdrStatus.Yes) return "";
+        List<string> types = new();
+        foreach (var v in videos)
+        {
+            if (v.HdrStatus == HdrStatus.Yes && !string.IsNullOrEmpty(v.HdrType) && !types.Contains(v.HdrType))
+            {
+                types.Add(v.HdrType);
+            }
+        }
+        if (types.Count == 0) return "";
+        if (types.Count == 1) return types[0];
+        return "Mixed";
+    }
+
+    private static string HdrStatusToJson(HdrStatus status)
+    {
+        return status switch
+        {
+            HdrStatus.Yes => "yes",
+            HdrStatus.No => "no",
+            _ => "unknown",
+        };
+    }
+
+    private static string HdrStatusToText(HdrStatus status, string type)
+    {
+        if (status == HdrStatus.Yes)
+        {
+            return string.IsNullOrEmpty(type) ? "是" : "是 (" + type + ")";
+        }
+        if (status == HdrStatus.No) return "否";
+        return "未知";
     }
 
     private static double StreamDurationSeconds(AVStream stream)
@@ -522,6 +838,7 @@ class Program
         if (info.General.FileSizeBytes > 0) lines.Add("│  大小：" + ToSize(info.General.FileSizeBytes));
         if (durationSeconds > 0) lines.Add("│  时长：" + FormatDurationSeconds(durationSeconds));
         if (overallBitrate > 0) lines.Add("│  码率：" + ToBitrate(overallBitrate));
+        lines.Add("│  HDR：" + HdrStatusToText(info.General.HdrStatus, info.General.HdrType));
         lines.Add("│");
 
         lines.Add("├─ 🎬 视频流 (" + info.Video.Count + " 路)");
@@ -538,6 +855,7 @@ class Program
             }
             if (v.FrameRate > 0) lines.Add("│  帧率：" + v.FrameRate.ToString("0.###") + " FPS");
             if (v.Bitrate > 0) lines.Add("│  码率：" + ToBitrate(v.Bitrate));
+            lines.Add("│  HDR：" + HdrStatusToText(v.HdrStatus, v.HdrType));
         }
         else if (info.Video.Count > 1)
         {
@@ -550,6 +868,7 @@ class Program
                 if (v.Width > 0 && v.Height > 0) parts.Add(v.Width + "x" + v.Height);
                 if (v.FrameRate > 0) parts.Add(v.FrameRate.ToString("0.###") + " FPS");
                 if (v.Bitrate > 0) parts.Add(ToBitrate(v.Bitrate));
+                parts.Add("HDR " + HdrStatusToText(v.HdrStatus, v.HdrType));
                 lines.Add(prefix + string.Join(" | ", parts));
             }
         }
@@ -661,6 +980,18 @@ class Program
             string dar = GetDisplayAspectRatio(v);
             if (!string.IsNullOrEmpty(dar)) writer.WriteString("displayAspectRatio", dar);
             if (v.FrameRate > 0) writer.WriteNumber("frameRate", v.FrameRate);
+            if (v.BitDepth > 0) writer.WriteNumber("bitDepth", v.BitDepth);
+            writer.WriteStartObject("color");
+            writer.WriteNumber("transferId", v.ColorTransfer);
+            writer.WriteString("transfer", ColorTransferName(v.ColorTransfer));
+            writer.WriteNumber("primariesId", v.ColorPrimaries);
+            writer.WriteString("primaries", ColorPrimariesName(v.ColorPrimaries));
+            writer.WriteNumber("matrixId", v.ColorMatrix);
+            writer.WriteString("matrix", ColorSpaceName(v.ColorMatrix));
+            writer.WriteEndObject();
+            writer.WriteString("hdrStatus", HdrStatusToJson(v.HdrStatus));
+            if (v.HdrStatus == HdrStatus.Yes && !string.IsNullOrEmpty(v.HdrType))
+                writer.WriteString("hdrType", v.HdrType);
             writer.WriteEndObject();
         }
         writer.WriteEndArray();
@@ -1125,6 +1456,27 @@ class Program
         NonKey = 32
     }
 
+    private enum HdrStatus
+    {
+        Unknown = 0,
+        No = 1,
+        Yes = 2
+    }
+
+    private struct HdrDecision
+    {
+        public HdrStatus Status;
+        public string Type;
+        public string Reason;
+
+        public HdrDecision(HdrStatus status, string type, string reason)
+        {
+            Status = status;
+            Type = type;
+            Reason = reason;
+        }
+    }
+
     [DllImport(AVFORMAT)]
     private static extern int avformat_open_input(out IntPtr ps, [MarshalAs(UnmanagedType.LPUTF8Str)] string url, IntPtr fmt, ref IntPtr options);
 
@@ -1198,7 +1550,19 @@ class Program
     private static extern int av_strerror(int errnum, StringBuilder errbuf, ulong errbuf_size);
 
     [DllImport(AVUTIL)]
+    private static extern IntPtr av_get_pix_fmt_name(int pix_fmt);
+
+    [DllImport(AVUTIL)]
     private static extern int av_get_pix_fmt([MarshalAs(UnmanagedType.LPUTF8Str)] string name);
+
+    [DllImport(AVUTIL)]
+    private static extern IntPtr av_color_transfer_name(int trc);
+
+    [DllImport(AVUTIL)]
+    private static extern IntPtr av_color_primaries_name(int primaries);
+
+    [DllImport(AVUTIL)]
+    private static extern IntPtr av_color_space_name(int colorspace);
 
     [DllImport(AVUTIL)]
     private static extern void av_freep(ref IntPtr ptr);
@@ -1414,6 +1778,8 @@ class Program
         public double DurationSeconds { get; set; }
         public long OverallBitrate { get; set; }
         public long FileSizeBytes { get; set; }
+        public HdrStatus HdrStatus { get; set; } = HdrStatus.Unknown;
+        public string HdrType { get; set; } = "";
     }
 
     private class VideoTrack
@@ -1426,6 +1792,12 @@ class Program
         public int Height { get; set; }
         public double FrameRate { get; set; }
         public long Bitrate { get; set; }
+        public int BitDepth { get; set; }
+        public int ColorTransfer { get; set; } = AVCOL_TRC_UNSPECIFIED;
+        public int ColorPrimaries { get; set; } = AVCOL_PRI_UNSPECIFIED;
+        public int ColorMatrix { get; set; } = AVCOL_SPC_UNSPECIFIED;
+        public HdrStatus HdrStatus { get; set; } = HdrStatus.Unknown;
+        public string HdrType { get; set; } = "";
         public int SampleAspectRatioNum { get; set; }
         public int SampleAspectRatioDen { get; set; }
     }
