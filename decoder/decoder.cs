@@ -47,6 +47,8 @@ class Program
     private const int AVCOL_SPC_BT2020_CL = 10;
     private const int AVCOL_SPC_ICTCP = 14;
 
+    private const int MAX_FRAMES_FALLBACK = 2; // 如果超过此帧数仍无关键帧，则降级接受
+
     private static readonly HashSet<string> HardwareTags = new()
     {
         "cuvid", "qsv", "vaapi", "dxva2", "d3d11va", "videotoolbox", "mediacodec", "nvdec", "amf"
@@ -94,9 +96,7 @@ class Program
                 ", no-screenshot=" + cli.SkipScreenshot +
                 ", debug=" + cli.DebugOutput +
                 ", max-probe-size=" + (cli.MaxProbeBytes > 0 ? ToSize(cli.MaxProbeBytes) : "default") +
-                ", max-analyze-seconds=" + (cli.MaxAnalyzeSeconds > 0 ? cli.MaxAnalyzeSeconds.ToString("0.###", CultureInfo.InvariantCulture) : "default") +
-                ", max-read-size=" + (cli.MaxReadBytes > 0 ? ToSize(cli.MaxReadBytes) : "default") +
-                ", max-read-seconds=" + (cli.MaxReadSeconds > 0 ? cli.MaxReadSeconds.ToString("0.###", CultureInfo.InvariantCulture) : "default"));
+                ", max-analyze-seconds=" + (cli.MaxAnalyzeSeconds > 0 ? cli.MaxAnalyzeSeconds.ToString("0.###", CultureInfo.InvariantCulture) : "default"));
             DebugLog(info, "🚀 启动解析流程");
             av_log_set_callback(LogCallbackDelegate);
             av_log_set_level(AV_LOG_QUIET);
@@ -138,7 +138,7 @@ class Program
             if (string.IsNullOrEmpty(inputPath))
             {
                 DebugLog(info, "❌ 未提供输入文件");
-                info.Error = "Usage: decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug] [--max-probe-size <size>] [--max-analyze-seconds <sec>] [--max-read-size <size>] [--max-read-seconds <sec>]";
+                info.Error = "Usage: decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug] [--max-probe-size <size>] [--max-analyze-seconds <sec>]";
                 return PrintMediaInfoAndReturn(info, 1);
             }
 
@@ -206,25 +206,16 @@ class Program
                 frame = av_frame_alloc();
                 if (packet == IntPtr.Zero || frame == IntPtr.Zero) throw new Exception("alloc packet/frame failed.");
 
-                long decodeMaxBytes = ResolveDecodeMaxBytes(cli, inputIsLocalFile);
-                double decodeMaxSeconds = ResolveDecodeMaxSeconds(cli, inputIsLocalFile);
-                if (decodeMaxBytes > 0 || decodeMaxSeconds > 0)
-                {
-                    string limitText = "🎯 解码预算: ";
-                    if (decodeMaxBytes > 0) limitText += "max-read-size=" + ToSize(decodeMaxBytes) + " ";
-                    if (decodeMaxSeconds > 0) limitText += "max-read-seconds=" + decodeMaxSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s";
-                    DebugLog(info, limitText.Trim());
-                }
-                DebugLog(info, "🎞️ 尝试解码首帧");
-                gotFrame = DecodeFirstFrame(formatCtx, codecCtx, packet, frame, videoStreamIndex, decodeMaxBytes, decodeMaxSeconds, info);
+                DebugLog(info, $"🎞️ 尝试解码首帧（优先查找关键帧，若超过{MAX_FRAMES_FALLBACK}帧仍无关键帧标记则自动降级）");
+                gotFrame = DecodeFirstFrame(formatCtx, codecCtx, packet, frame, videoStreamIndex, info);
                 srcFrame = gotFrame ? Marshal.PtrToStructure<AVFrame>(frame) : default;
                 info.Decoder = selected.Name;
                 DebugLog(info, gotFrame ? "✅ 成功解码到视频帧" : "⚠️ 未解码到可用视频帧");
             }
             else
             {
-                long sampleMaxBytes = ResolveDecodeMaxBytes(cli, inputIsLocalFile);
-                double sampleMaxSeconds = ResolveDecodeMaxSeconds(cli, inputIsLocalFile);
+                long sampleMaxBytes = ResolveProbeBytes(cli, inputIsLocalFile);
+                double sampleMaxSeconds = ResolveAnalyzeSeconds(cli, inputIsLocalFile);
                 AVFormatContext fmtCurrent = Marshal.PtrToStructure<AVFormatContext>(formatCtx);
                 bool needsBitrateSampling = fmtCurrent.bit_rate <= 0;
                 if (!inputIsLocalFile && needsBitrateSampling && (sampleMaxBytes > 0 || sampleMaxSeconds > 0))
@@ -233,7 +224,7 @@ class Program
                     if (packet != IntPtr.Zero)
                     {
                         DebugLog(info, "📡 无截图模式：进行短时包采样以估算码率");
-                        SampleBitrateFromPackets(formatCtx, packet, sampleMaxBytes, sampleMaxSeconds, info);
+                        SampleBitrateFromPackets(formatCtx, packet, info);
                     }
                 }
                 else if (!inputIsLocalFile && !needsBitrateSampling)
@@ -360,36 +351,7 @@ class Program
                 options.MaxAnalyzeSeconds = value;
                 continue;
             }
-            if (arg.Equals("--max-read-size", StringComparison.OrdinalIgnoreCase))
-            {
-                if (i + 1 >= args.Length)
-                {
-                    options.Error = "Missing value for --max-read-size.";
-                    return options;
-                }
-                if (!TryParseSizeToBytes(args[++i], out long value) || value <= 0)
-                {
-                    options.Error = "Invalid --max-read-size value.";
-                    return options;
-                }
-                options.MaxReadBytes = value;
-                continue;
-            }
-            if (arg.Equals("--max-read-seconds", StringComparison.OrdinalIgnoreCase))
-            {
-                if (i + 1 >= args.Length)
-                {
-                    options.Error = "Missing value for --max-read-seconds.";
-                    return options;
-                }
-                if (!TryParsePositiveDouble(args[++i], out double value))
-                {
-                    options.Error = "Invalid --max-read-seconds value.";
-                    return options;
-                }
-                options.MaxReadSeconds = value;
-                continue;
-            }
+
             if (arg.StartsWith("--", StringComparison.Ordinal))
             {
                 options.Error = "Unknown option: " + arg;
@@ -560,23 +522,9 @@ class Program
         return cli.SkipScreenshot ? 2.0 : 5.0;
     }
 
-    private static long ResolveDecodeMaxBytes(CliOptions cli, bool inputIsLocalFile)
-    {
-        if (cli.MaxReadBytes > 0) return cli.MaxReadBytes;
-        if (inputIsLocalFile) return 0;
-        return cli.SkipScreenshot ? 8L * 1024L * 1024L : 64L * 1024L * 1024L;
-    }
-
-    private static double ResolveDecodeMaxSeconds(CliOptions cli, bool inputIsLocalFile)
-    {
-        if (cli.MaxReadSeconds > 0) return cli.MaxReadSeconds;
-        if (inputIsLocalFile) return 0;
-        return cli.SkipScreenshot ? 3.0 : 15.0;
-    }
-
     private static long ResolveNetworkTimeoutUs(CliOptions cli, bool inputIsLocalFile)
     {
-        double timeoutSec = ResolveDecodeMaxSeconds(cli, inputIsLocalFile);
+        double timeoutSec = ResolveAnalyzeSeconds(cli, inputIsLocalFile);
         long us = (long)Math.Round(timeoutSec * 1_000_000.0);
         return us > 0 ? us : 0;
     }
@@ -635,26 +583,15 @@ class Program
         return result;
     }
 
-    private static bool DecodeFirstFrame(IntPtr formatCtx, IntPtr codecCtx, IntPtr packet, IntPtr frame, int videoStreamIndex, long maxReadBytes, double maxReadSeconds, MediaInfo info)
+    private static bool DecodeFirstFrame(IntPtr formatCtx, IntPtr codecCtx, IntPtr packet, IntPtr frame, int videoStreamIndex, MediaInfo info)
     {
         ReadStatAccumulator stats = new ReadStatAccumulator();
         Stopwatch sw = Stopwatch.StartNew();
+        int decodedFrameCount = 0;
         while (av_read_frame(formatCtx, packet) >= 0)
         {
             AVPacket pkt = Marshal.PtrToStructure<AVPacket>(packet);
             stats.AddPacket(formatCtx, pkt);
-            if (maxReadBytes > 0 && stats.TotalBytes > maxReadBytes)
-            {
-                DebugLog(info, "⛔ 达到读取上限: " + ToSize(stats.TotalBytes) + " > " + ToSize(maxReadBytes));
-                av_packet_unref(packet);
-                break;
-            }
-            if (maxReadSeconds > 0 && sw.Elapsed.TotalSeconds > maxReadSeconds)
-            {
-                DebugLog(info, "⛔ 达到读取时长上限: " + sw.Elapsed.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s > " + maxReadSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s");
-                av_packet_unref(packet);
-                break;
-            }
             if (pkt.stream_index == videoStreamIndex)
             {
                 int ret = avcodec_send_packet(codecCtx, packet);
@@ -668,10 +605,25 @@ class Program
                     ret = avcodec_receive_frame(codecCtx, frame);
                     if (ret == AVERROR_EAGAIN || ret == AVERROR_EOF) break;
                     if (ret < 0) break;
-                    DebugLog(info, "✅ 解码首帧成功，立即停止读取");
-                    if (!info.IsLocalInput) ApplyObservedBitrate(info, stats, sw.Elapsed.TotalSeconds);
-                    av_packet_unref(packet);
-                    return true;
+                    decodedFrameCount++;
+                    // 检查是否为关键帧
+                    AVFrame decodedFrame = Marshal.PtrToStructure<AVFrame>(frame);
+                    if (decodedFrame.key_frame != 0)
+                    {
+                        DebugLog(info, "✅ 解码首帧成功（关键帧），立即停止读取");
+                        if (!info.IsLocalInput) ApplyObservedBitrate(info, stats, sw.Elapsed.TotalSeconds);
+                        av_packet_unref(packet);
+                        return true;
+                    }
+                    // key_frame 标记不可靠或未设置，降级处理
+                    if (decodedFrameCount >= MAX_FRAMES_FALLBACK)
+                    {
+                        DebugLog(info, "⚠️ 已解码 " + decodedFrameCount + " 帧未找到关键帧标记，解码器可能未正确设置key_frame，降级接受当前帧");
+                        if (!info.IsLocalInput) ApplyObservedBitrate(info, stats, sw.Elapsed.TotalSeconds);
+                        av_packet_unref(packet);
+                        return true;
+                    }
+                    DebugLog(info, "⏩ 非关键帧 (" + decodedFrameCount + "/" + MAX_FRAMES_FALLBACK + ")，继续解码");
                 }
             }
             av_packet_unref(packet);
@@ -684,15 +636,29 @@ class Program
             int flushRet = avcodec_receive_frame(codecCtx, frame);
             if (flushRet == 0)
             {
-                DebugLog(info, "✅ Flush 解码得到首帧");
-                return true;
+                decodedFrameCount++;
+                // 检查是否为关键帧
+                AVFrame decodedFrame = Marshal.PtrToStructure<AVFrame>(frame);
+                if (decodedFrame.key_frame != 0)
+                {
+                    DebugLog(info, "✅ Flush 解码得到首帧（关键帧）");
+                    return true;
+                }
+                // key_frame 标记不可靠或未设置，降级处理
+                if (decodedFrameCount >= MAX_FRAMES_FALLBACK)
+                {
+                    DebugLog(info, "⚠️ Flush 已解码 " + decodedFrameCount + " 帧未找到关键帧标记，降级接受当前帧");
+                    return true;
+                }
+                DebugLog(info, "⏩ Flush 得到非关键帧 (" + decodedFrameCount + "/" + MAX_FRAMES_FALLBACK + ")，继续解码");
+                continue;
             }
             if (flushRet == AVERROR_EAGAIN || flushRet == AVERROR_EOF) return false;
             if (flushRet < 0) return false;
         }
     }
 
-    private static void SampleBitrateFromPackets(IntPtr formatCtx, IntPtr packet, long maxReadBytes, double maxReadSeconds, MediaInfo info)
+    private static void SampleBitrateFromPackets(IntPtr formatCtx, IntPtr packet, MediaInfo info)
     {
         ReadStatAccumulator stats = new ReadStatAccumulator();
         Stopwatch sw = Stopwatch.StartNew();
@@ -702,16 +668,6 @@ class Program
             stats.AddPacket(formatCtx, pkt);
             av_packet_unref(packet);
 
-            if (maxReadBytes > 0 && stats.TotalBytes > maxReadBytes)
-            {
-                DebugLog(info, "⛔ 采样达到读取上限: " + ToSize(stats.TotalBytes) + " > " + ToSize(maxReadBytes));
-                break;
-            }
-            if (maxReadSeconds > 0 && sw.Elapsed.TotalSeconds > maxReadSeconds)
-            {
-                DebugLog(info, "⛔ 采样达到时长上限: " + sw.Elapsed.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s > " + maxReadSeconds.ToString("0.###", CultureInfo.InvariantCulture) + "s");
-                break;
-            }
             if (stats.DurationSeconds >= 1.0 && stats.TotalBytes >= 512 * 1024)
             {
                 DebugLog(info, "✅ 采样已获得可用时间轴与数据量，提前结束");
@@ -2246,8 +2202,6 @@ class Program
         public bool DebugOutput { get; set; }
         public long MaxProbeBytes { get; set; }
         public double MaxAnalyzeSeconds { get; set; }
-        public long MaxReadBytes { get; set; }
-        public double MaxReadSeconds { get; set; }
         public string Error { get; set; } = "";
     }
 

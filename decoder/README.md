@@ -11,7 +11,7 @@
 ## 命令格式
 
 ```bash
-decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug] [--max-probe-size <size>] [--max-analyze-seconds <sec>] [--max-read-size <size>] [--max-read-seconds <sec>]
+decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug] [--max-probe-size <size>] [--max-analyze-seconds <sec>]
 ```
 
 `<input>` 支持本地文件路径或 FFmpeg 可识别输入源（如 `http/https/rtsp/rtp/udp/pipe/concat/...`）。
@@ -32,16 +32,12 @@ decoder <input> [--output <png>] [--no-screenshot] [--json] [--debug] [--max-pro
   控制探测阶段最大读取预算（映射到 FFmpeg `probesize`），支持 `K/M/G` 后缀，例如 `8M`
 - `--max-analyze-seconds <sec>`
   控制探测阶段最大分析时长（映射到 FFmpeg `analyzeduration`）
-- `--max-read-size <size>`
-  控制读取预算（截图解码阶段；在 `--no-screenshot` 且网络输入时用于短时包采样码率）
-- `--max-read-seconds <sec>`
-  控制读取最大等待时长；也会作为网络 IO 超时预算应用于网络输入
 
 默认预算策略（未显式指定上述参数时）：
 - 本地文件 + 截图：`probesize=50MiB`，`analyzeduration=10s`
 - 本地文件 + `--no-screenshot`：`probesize=20MiB`，`analyzeduration=3s`
-- 网络输入 + 截图：`probesize=20MiB`，`analyzeduration=5s`，`max-read-size=64MiB`，`max-read-seconds=15s`
-- 网络输入 + `--no-screenshot`：`probesize=8MiB`，`analyzeduration=2s`；当容器未提供码率时再做最多 `8MiB/3s` 的短时包采样用于估算码率
+- 网络输入 + 截图：`probesize=20MiB`，`analyzeduration=5s`
+- 网络输入 + `--no-screenshot`：`probesize=8MiB`，`analyzeduration=2s`
 
 ## 使用示例
 
@@ -84,7 +80,7 @@ decoder "W:\Samples\AVS2.ts" --json --debug
 ### 7) 限制探测与读取预算（更快返回）
 
 ```bash
-decoder "rtsp://example.com/live/stream" --max-probe-size 8M --max-analyze-seconds 2 --max-read-size 32M --max-read-seconds 8
+decoder "rtsp://example.com/live/stream" --max-probe-size 8M --max-analyze-seconds 2
 ```
 
 ## 输出说明
