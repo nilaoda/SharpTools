@@ -38,6 +38,12 @@ class Program
     private const int AVCOL_PRI_BT709 = 1;
     private const int AVCOL_PRI_UNSPECIFIED = 2;
     private const int AVCOL_PRI_BT2020 = 9;
+    private const int AV_FIELD_UNKNOWN = 0;
+    private const int AV_FIELD_PROGRESSIVE = 1;
+    private const int AV_FIELD_TT = 2;
+    private const int AV_FIELD_BB = 3;
+    private const int AV_FIELD_TB = 4;
+    private const int AV_FIELD_BT = 5;
     private const int AVCOL_SPC_RESERVED0 = 0;
     private const int AVCOL_SPC_BT709 = 1;
     private const int AVCOL_SPC_UNSPECIFIED = 2;
@@ -937,7 +943,8 @@ class Program
                     ColorMatrix = resolvedMatrix,
                     BitDepth = resolvedBitDepth,
                     SampleAspectRatioNum = sampleAspectRatio.num,
-                    SampleAspectRatioDen = sampleAspectRatio.den
+                    SampleAspectRatioDen = sampleAspectRatio.den,
+                    FieldOrder = cp.field_order
                 };
                 info.Video.Add(vt);
             }
@@ -1296,7 +1303,6 @@ class Program
         if (info.General.FileSizeBytes > 0) lines.Add("│  大小：" + ToSize(info.General.FileSizeBytes));
         if (durationSeconds > 0) lines.Add("│  时长：" + FormatDurationSeconds(durationSeconds));
         if (overallBitrate > 0) lines.Add("│  码率：" + ToBitrate(overallBitrate));
-        lines.Add("│  HDR：" + HdrStatusToText(info.General.HdrStatus, info.General.HdrType));
         lines.Add("│");
 
         lines.Add("├─ 🎬 视频流 (" + info.Video.Count + " 路)");
@@ -1307,9 +1313,7 @@ class Program
             lines.Add("│  编码：" + NormalizeCodecName(v.Codec));
             if (v.Width > 0 && v.Height > 0)
             {
-                string res = v.Width + "x" + v.Height;
-                if (!string.IsNullOrEmpty(dar)) res += " (" + dar + ")";
-                lines.Add("│  分辨率：" + res);
+                lines.Add("│  分辨率：" + BuildResolutionText(v, true, dar));
             }
             if (v.FrameRate > 0) lines.Add("│  帧率：" + v.FrameRate.ToString("0.###") + " FPS");
             if (v.Bitrate > 0) lines.Add("│  码率：" + ToBitrate(v.Bitrate));
@@ -1323,7 +1327,7 @@ class Program
                 string prefix = (i == info.Video.Count - 1) ? "│  └─ " : "│  ├─ ";
                 List<string> parts = new();
                 parts.Add("[" + (i + 1) + "] " + NormalizeCodecName(v.Codec));
-                if (v.Width > 0 && v.Height > 0) parts.Add(v.Width + "x" + v.Height);
+                if (v.Width > 0 && v.Height > 0) parts.Add(BuildResolutionText(v, false, ""));
                 if (v.FrameRate > 0) parts.Add(v.FrameRate.ToString("0.###") + " FPS");
                 if (v.Bitrate > 0) parts.Add(ToBitrate(v.Bitrate));
                 parts.Add("HDR " + HdrStatusToText(v.HdrStatus, v.HdrType));
@@ -1437,6 +1441,7 @@ class Program
             }
             writer.WriteNumber("width", v.Width);
             writer.WriteNumber("height", v.Height);
+            writer.WriteString("scanType", FieldOrderToScanType(v.FieldOrder));
             string dar = GetDisplayAspectRatio(v);
             if (!string.IsNullOrEmpty(dar)) writer.WriteString("displayAspectRatio", dar);
             if (v.FrameRate > 0) writer.WriteNumber("frameRate", v.FrameRate);
@@ -1565,6 +1570,39 @@ class Program
         }
         int g = Gcd(num, den);
         return g > 0 ? (num / g) + ":" + (den / g) : "";
+    }
+
+    private static string BuildResolutionText(VideoTrack v, bool includeDar, string dar)
+    {
+        string res = v.Width + "x" + v.Height + FieldOrderToSuffix(v.FieldOrder);
+        if (includeDar && !string.IsNullOrEmpty(dar)) res += " (" + dar + ")";
+        return res;
+    }
+
+    private static string FieldOrderToScanType(int fieldOrder)
+    {
+        return fieldOrder switch
+        {
+            AV_FIELD_PROGRESSIVE => "progressive",
+            AV_FIELD_TT => "interlaced",
+            AV_FIELD_BB => "interlaced",
+            AV_FIELD_TB => "interlaced",
+            AV_FIELD_BT => "interlaced",
+            _ => "unknown"
+        };
+    }
+
+    private static string FieldOrderToSuffix(int fieldOrder)
+    {
+        return fieldOrder switch
+        {
+            AV_FIELD_PROGRESSIVE => "p",
+            AV_FIELD_TT => "i",
+            AV_FIELD_BB => "i",
+            AV_FIELD_TB => "i",
+            AV_FIELD_BT => "i",
+            _ => ""
+        };
     }
 
     private static int Gcd(int a, int b)
@@ -2275,6 +2313,7 @@ class Program
         public string HdrType { get; set; } = "";
         public int SampleAspectRatioNum { get; set; }
         public int SampleAspectRatioDen { get; set; }
+        public int FieldOrder { get; set; }
     }
 
     private class AudioTrack
