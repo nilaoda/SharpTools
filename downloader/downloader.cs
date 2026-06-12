@@ -261,7 +261,7 @@ public class RobustDownloader
         try
         {
             var rangeRequest = new HttpRequestMessage(HttpMethod.Get, url);
-            rangeRequest.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+            rangeRequest.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 1);
             using var rangeResponse = await client.SendAsync(rangeRequest, HttpCompletionOption.ResponseHeadersRead);
 
             if (rangeResponse.StatusCode == HttpStatusCode.PartialContent)
